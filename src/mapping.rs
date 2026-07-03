@@ -1,5 +1,22 @@
+use crate::item_id::ItemId;
 use crate::subsonic::*;
 use crate::tidal_client::*;
+
+/// Extract the primary artist name and TIDAL id from an album detail, preferring
+/// the singular `artist` field and falling back to the first entry of `artists`.
+/// Returns the display name (or "Unknown Artist") and the numeric artist id if
+/// one is present.
+pub fn primary_artist(album: &TidalAlbumDetail) -> (String, Option<u64>) {
+    let primary = album
+        .artist
+        .as_ref()
+        .or_else(|| album.artists.as_ref().and_then(|a| a.first()));
+    let name = primary
+        .map(|a| a.name.clone())
+        .unwrap_or_else(|| "Unknown Artist".to_string());
+    let id = primary.map(|a| a.id);
+    (name, id)
+}
 
 /// Build a Subsonic cover-art ID from a Tidal image reference. TIDAL image
 /// references are UUIDs like `b66a5c40-c34d-4507-a0dc-5f98e46fdd20`; we store
@@ -104,29 +121,20 @@ mod tests {
 
 /// Convert a Tidal track to a Subsonic Child (song entry)
 pub fn track_to_child(track: &TidalTrack, _base_url: &str) -> SubsonicChild {
-    let album_id = track.album.as_ref().map(|a| format!("al-{}", a.id));
+    let album_id = track.album.as_ref().map(|a| ItemId::Album(a.id).to_string());
     let cover_art = track
         .album
         .as_ref()
         .and_then(|a| a.cover.as_ref())
         .map(|c| cover_art_id(c));
-    let artist_name = track
+    let primary = track
         .artist
         .as_ref()
+        .or_else(|| track.artists.as_ref().and_then(|a| a.first()));
+    let artist_name = primary
         .map(|a| a.name.clone())
-        .or_else(|| track.artists.as_ref().and_then(|a| a.first()).map(|a| a.name.clone()))
         .unwrap_or_else(|| "Unknown Artist".to_string());
-    let artist_id = track
-        .artist
-        .as_ref()
-        .map(|a| format!("ar-{}", a.id))
-        .or_else(|| {
-            track
-                .artists
-                .as_ref()
-                .and_then(|a| a.first())
-                .map(|a| format!("ar-{}", a.id))
-        });
+    let artist_id = primary.map(|a| ItemId::Artist(a.id).to_string());
 
     // TIDAL delivers every quality as fragmented MP4 (AAC or FLAC-in-MP4), and
     // the proxy concatenates those segments into an MP4 file — so advertise the
@@ -135,7 +143,7 @@ pub fn track_to_child(track: &TidalTrack, _base_url: &str) -> SubsonicChild {
     let content_type = "audio/mp4";
 
     SubsonicChild {
-        id: format!("tr-{}", track.id),
+        id: ItemId::Track(track.id).to_string(),
         parent: album_id.clone(),
         is_dir: false,
         title: track.title.clone(),
@@ -156,7 +164,7 @@ pub fn track_to_child(track: &TidalTrack, _base_url: &str) -> SubsonicChild {
         transcoded_suffix: Some(suffix.to_string()),
         duration: Some(track.duration),
         bit_rate: None,
-        path: Some(format!("tr-{}", track.id)),
+        path: Some(ItemId::Track(track.id).to_string()),
         is_video: Some(false),
         play_count: None,
         disc_number: track.volume_number.or(Some(1)),
@@ -172,7 +180,7 @@ pub fn track_to_child(track: &TidalTrack, _base_url: &str) -> SubsonicChild {
 /// Convert a Tidal artist to Subsonic Artist
 pub fn artist_to_subsonic(artist: &TidalArtistDetail) -> SubsonicArtist {
     SubsonicArtist {
-        id: format!("ar-{}", artist.id),
+        id: ItemId::Artist(artist.id).to_string(),
         name: artist.name.clone(),
         cover_art: artist
             .picture
@@ -188,7 +196,7 @@ pub fn artist_to_subsonic(artist: &TidalArtistDetail) -> SubsonicArtist {
 /// Convert a search TidalArtist to Subsonic Artist
 pub fn search_artist_to_subsonic(artist: &TidalArtist) -> SubsonicArtist {
     SubsonicArtist {
-        id: format!("ar-{}", artist.id),
+        id: ItemId::Artist(artist.id).to_string(),
         name: artist.name.clone(),
         cover_art: artist
             .picture
@@ -203,23 +211,8 @@ pub fn search_artist_to_subsonic(artist: &TidalArtist) -> SubsonicArtist {
 
 /// Convert a Tidal album to Subsonic Album
 pub fn album_to_subsonic(album: &TidalAlbumDetail) -> SubsonicAlbum {
-    let artist_name = album
-        .artist
-        .as_ref()
-        .map(|a| a.name.clone())
-        .or_else(|| album.artists.as_ref().and_then(|a| a.first()).map(|a| a.name.clone()))
-        .unwrap_or_else(|| "Unknown Artist".to_string());
-    let artist_id = album
-        .artist
-        .as_ref()
-        .map(|a| format!("ar-{}", a.id))
-        .or_else(|| {
-            album
-                .artists
-                .as_ref()
-                .and_then(|a| a.first())
-                .map(|a| format!("ar-{}", a.id))
-        });
+    let (artist_name, artist_id) = primary_artist(album);
+    let artist_id = artist_id.map(|id| ItemId::Artist(id).to_string());
 
     let year = album
         .release_date
@@ -227,7 +220,7 @@ pub fn album_to_subsonic(album: &TidalAlbumDetail) -> SubsonicAlbum {
         .and_then(|d| d[..4].parse::<u32>().ok());
 
     SubsonicAlbum {
-        id: format!("al-{}", album.id),
+        id: ItemId::Album(album.id).to_string(),
         name: if let Some(ref version) = album.version {
             if !version.is_empty() {
                 format!("{} ({})", album.title, version)
@@ -292,30 +285,15 @@ pub fn album_detail_to_album_with_songs(
     tracks: &[TidalTrack],
     base_url: &str,
 ) -> AlbumWithSongs {
-    let artist_name = album
-        .artist
-        .as_ref()
-        .map(|a| a.name.clone())
-        .or_else(|| album.artists.as_ref().and_then(|a| a.first()).map(|a| a.name.clone()))
-        .unwrap_or_else(|| "Unknown Artist".to_string());
-    let artist_id = album
-        .artist
-        .as_ref()
-        .map(|a| format!("ar-{}", a.id))
-        .or_else(|| {
-            album
-                .artists
-                .as_ref()
-                .and_then(|a| a.first())
-                .map(|a| format!("ar-{}", a.id))
-        });
+    let (artist_name, artist_id) = primary_artist(album);
+    let artist_id = artist_id.map(|id| ItemId::Artist(id).to_string());
     let year = album
         .release_date
         .as_ref()
         .and_then(|d| d[..4].parse::<u32>().ok());
 
     AlbumWithSongs {
-        id: format!("al-{}", album.id),
+        id: ItemId::Album(album.id).to_string(),
         name: album.title.clone(),
         artist: Some(artist_name),
         artist_id,
@@ -334,7 +312,7 @@ pub fn album_detail_to_album_with_songs(
 /// Convert a Tidal playlist to Subsonic Playlist
 pub fn playlist_to_subsonic(playlist: &TidalPlaylist) -> SubsonicPlaylist {
     SubsonicPlaylist {
-        id: format!("pl-{}", playlist.uuid),
+        id: ItemId::Playlist(playlist.uuid.clone()).to_string(),
         name: playlist.title.clone(),
         comment: playlist.description.clone(),
         owner: playlist

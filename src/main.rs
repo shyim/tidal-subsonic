@@ -1,14 +1,16 @@
 mod auth;
 mod db;
+mod item_id;
 mod mapping;
 mod response;
 mod subsonic;
 mod tidal_client;
 
 use auth::PkceSession;
+use item_id::ItemId;
 use axum::{
-    extract::{Query, State},
-    http::{header, HeaderMap, StatusCode},
+    extract::{FromRequestParts, Query, State},
+    http::{header, request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -22,8 +24,129 @@ use subsonic::*;
 use tidal_client::*;
 use tower_http::trace::TraceLayer;
 
-const API_VERSION: &str = "1.16.1";
-const SERVER_NAME: &str = "tidal-subsonic";
+tokio::task_local! {
+    /// The response format/callback the current request asked for. Set by the
+    /// `Authed` extractor (and the fallback handler) before a handler runs so
+    /// that `ApiError`'s `IntoResponse` can render errors in the client's format
+    /// even though it never sees the query params directly.
+    static RESPONSE_CTX: (ResponseFormat, Option<String>);
+}
+
+/// Read the current request's response format + jsonp callback, falling back to
+/// XML / no-callback if no context was established (should not happen for
+/// handlers behind `Authed`).
+fn current_response_ctx() -> (ResponseFormat, Option<String>) {
+    RESPONSE_CTX
+        .try_with(|ctx| ctx.clone())
+        .unwrap_or((ResponseFormat::Xml, None))
+}
+
+/// Render a Subsonic response using the current request's response context.
+fn render_current(resp: &SubsonicResponse) -> Response {
+    let (format, callback) = current_response_ctx();
+    response::render(resp, format, callback.as_deref())
+}
+
+/// Authenticated-request extractor. Running it verifies the Subsonic
+/// credentials (token `t`+`s` or legacy `p=` password) exactly as `verify_auth`
+/// did per-handler, and rejects with the Subsonic `Wrong username or password`
+/// error (code 40) rendered in the client-requested format. On success it
+/// exposes the `AppState`, the parsed query `params`, and helpers to reach the
+/// TIDAL client and render responses.
+struct Authed {
+    state: AppState,
+    params: SubsonicParams,
+}
+
+impl Authed {
+    /// The shared TIDAL client for this request.
+    fn tidal(&self) -> &SharedTidalClient {
+        &self.state.tidal
+    }
+
+    /// The authenticated TIDAL user id, or `ApiError::NotAuthedTidal` if the
+    /// proxy has no TIDAL session yet.
+    async fn tidal_user_id(&self) -> Result<u64, ApiError> {
+        self.state
+            .tidal
+            .user_id()
+            .await
+            .ok_or(ApiError::NotAuthedTidal)
+    }
+}
+
+#[axum::async_trait]
+impl FromRequestParts<AppState> for Authed {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let Query(params) = Query::<SubsonicParams>::from_request_parts(parts, state)
+            .await
+            .unwrap_or_else(|_| Query(SubsonicParams::default()));
+        if !verify_auth(state, &params) {
+            return Err(ApiError::Auth);
+        }
+        Ok(Authed {
+            state: state.clone(),
+            params,
+        })
+    }
+}
+
+/// A handler-level error that maps to a Subsonic error response. `IntoResponse`
+/// renders it in the request's current response format (set by `Authed`).
+enum ApiError {
+    /// Subsonic auth failed: code 40, "Wrong username or password".
+    Auth,
+    /// The proxy has no TIDAL session yet: code 0.
+    NotAuthedTidal,
+    /// A client/request error (e.g. missing/invalid id): the given Subsonic code.
+    BadRequest(u32, String),
+    /// An upstream TIDAL error: code 0.
+    Tidal(String),
+}
+
+impl ApiError {
+    fn to_subsonic(&self) -> SubsonicResponse {
+        match self {
+            ApiError::Auth => SubsonicResponse::error(40, "Wrong username or password"),
+            ApiError::NotAuthedTidal => {
+                SubsonicResponse::error(0, "Not authenticated with TIDAL")
+            }
+            ApiError::BadRequest(code, msg) => SubsonicResponse::error(*code, msg),
+            ApiError::Tidal(msg) => SubsonicResponse::error(0, msg),
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        render_current(&self.to_subsonic())
+    }
+}
+
+/// Successful Subsonic payload returned by a handler; `IntoResponse` renders it
+/// (with `status="ok"`) in the request's current response format.
+struct ApiOk(SubsonicResponse);
+
+impl IntoResponse for ApiOk {
+    fn into_response(self) -> Response {
+        render_current(&self.0)
+    }
+}
+
+impl From<Payload> for ApiOk {
+    fn from(payload: Payload) -> Self {
+        ApiOk(SubsonicResponse::ok_with(payload))
+    }
+}
+
+/// The common handler result: a Subsonic payload/OK response, or an `ApiError`.
+/// Both arms serialize via `response::render` in the requested format.
+type ApiResult = Result<ApiOk, ApiError>;
 
 #[derive(Clone)]
 struct AppState {
@@ -174,79 +297,14 @@ fn respond(resp: &SubsonicResponse, params: &SubsonicParams) -> Response {
     response::render(resp, params.format(), params.callback.as_deref())
 }
 
+/// Thin wrapper preserved for call sites: a failed response with an error.
 fn xml_error(code: u32, message: &str) -> SubsonicResponse {
-    SubsonicResponse {
-        xmlns: "http://subsonic.org/restapi".to_string(),
-        status: "failed".to_string(),
-        version: API_VERSION.to_string(),
-        server_type: SERVER_NAME.to_string(),
-        server_version: env!("CARGO_PKG_VERSION").to_string(),
-        open_subsonic: true,
-        error: Some(SubsonicError {
-            code,
-            message: message.to_string(),
-        }),
-        license: None,
-        music_folders: None,
-        indexes: None,
-        artists: None,
-        artist: None,
-        album: None,
-        song: None,
-        album_list: None,
-        album_list2: None,
-        random_songs: None,
-        songs_by_genre: None,
-        now_playing: None,
-        starred: None,
-        starred2: None,
-        search_result: None,
-        search_result2: None,
-        search_result3: None,
-        playlists: None,
-        playlist: None,
-        user: None,
-        scan_status: None,
-        genres: None,
-        open_subsonic_extensions: None,
-        directory: None,
-    }
+    SubsonicResponse::error(code, message)
 }
 
+/// Thin wrapper preserved for call sites: a successful response, no payload.
 fn xml_ok() -> SubsonicResponse {
-    SubsonicResponse {
-        xmlns: "http://subsonic.org/restapi".to_string(),
-        status: "ok".to_string(),
-        version: API_VERSION.to_string(),
-        server_type: SERVER_NAME.to_string(),
-        server_version: env!("CARGO_PKG_VERSION").to_string(),
-        open_subsonic: true,
-        error: None,
-        license: None,
-        music_folders: None,
-        indexes: None,
-        artists: None,
-        artist: None,
-        album: None,
-        song: None,
-        album_list: None,
-        album_list2: None,
-        random_songs: None,
-        songs_by_genre: None,
-        now_playing: None,
-        starred: None,
-        starred2: None,
-        search_result: None,
-        search_result2: None,
-        search_result3: None,
-        playlists: None,
-        playlist: None,
-        user: None,
-        scan_status: None,
-        genres: None,
-        open_subsonic_extensions: None,
-        directory: None,
-    }
+    SubsonicResponse::ok()
 }
 
 fn base_url_from_headers(headers: &HeaderMap) -> String {
@@ -262,361 +320,228 @@ fn base_url_from_headers(headers: &HeaderMap) -> String {
     format!("{}://{}", proto, host)
 }
 
-async fn handle_ping(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-    _headers: HeaderMap,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let resp = xml_ok();
-    respond(&resp, &params)
+async fn handle_ping(_authed: Authed) -> ApiResult {
+    Ok(ApiOk(xml_ok()))
 }
 
-async fn handle_get_license(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let mut resp = xml_ok();
-    resp.license = Some(License {
+async fn handle_get_license(_authed: Authed) -> ApiResult {
+    Ok(Payload::License(License {
         valid: true,
         email: None,
         license_expires: None,
         trial_expires: None,
-    });
-    respond(&resp, &params)
+    })
+    .into())
 }
 
-async fn handle_get_music_folders(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let mut resp = xml_ok();
-    resp.music_folders = Some(MusicFolders {
+async fn handle_get_music_folders(_authed: Authed) -> ApiResult {
+    Ok(Payload::MusicFolders(MusicFolders {
         music_folder: vec![MusicFolder {
             id: 1,
             name: "TIDAL".to_string(),
         }],
-    });
-    respond(&resp, &params)
+    })
+    .into())
 }
 
-async fn handle_get_indexes(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let mut resp = xml_ok();
-    let mut client = state.tidal.lock().await;
-    let user_id = match client.user_id() {
-        Some(id) => id,
-        None => {
-            return respond(&xml_error(0, "Not authenticated with TIDAL"), &params);
-        }
-    };
-    match client.get_favorite_artists(user_id, 0, 500).await {
-        Ok(artists) => {
-            resp.indexes = Some(mapping::build_indexes(&artists.items));
-        }
-        Err(e) => {
-            resp.error = Some(SubsonicError { code: 0, message: e });
-            resp.status = "failed".to_string();
-        }
-    }
-    respond(&resp, &params)
+async fn handle_get_indexes(authed: Authed) -> ApiResult {
+    let client = authed.tidal();
+    let user_id = authed.tidal_user_id().await?;
+    let artists = client
+        .get_favorite_artists(user_id, 0, 500)
+        .await
+        .map_err(ApiError::Tidal)?;
+    Ok(Payload::Indexes(mapping::build_indexes(&artists.items)).into())
 }
 
-async fn handle_get_artists(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let mut resp = xml_ok();
-    let mut client = state.tidal.lock().await;
-    let user_id = match client.user_id() {
-        Some(id) => id,
-        None => {
-            return respond(&xml_error(0, "Not authenticated with TIDAL"), &params);
-        }
-    };
-    match client.get_favorite_artists(user_id, 0, 500).await {
-        Ok(artists) => {
-            let indexes = mapping::build_indexes(&artists.items);
-            resp.artists = Some(ArtistsList {
-                ignored_articles: indexes.ignored_articles,
-                index: indexes.index,
-            });
-        }
-        Err(e) => {
-            resp.error = Some(SubsonicError { code: 0, message: e });
-            resp.status = "failed".to_string();
-        }
-    }
-    respond(&resp, &params)
+async fn handle_get_artists(authed: Authed) -> ApiResult {
+    let client = authed.tidal();
+    let user_id = authed.tidal_user_id().await?;
+    let artists = client
+        .get_favorite_artists(user_id, 0, 500)
+        .await
+        .map_err(ApiError::Tidal)?;
+    let indexes = mapping::build_indexes(&artists.items);
+    Ok(Payload::Artists(ArtistsList {
+        ignored_articles: indexes.ignored_articles,
+        index: indexes.index,
+    })
+    .into())
 }
 
-async fn handle_get_artist(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let mut resp = xml_ok();
-    let artist_id_str = match &params.id {
-        Some(id) => id.clone(),
-        None => return respond(&xml_error(10, "Missing artist id"), &params),
-    };
-    let artist_id: u64 = match artist_id_str.strip_prefix("ar-").and_then(|s| s.parse().ok()) {
-        Some(id) => id,
-        None => return respond(&xml_error(0, "Invalid artist id"), &params),
+async fn handle_get_artist(authed: Authed) -> ApiResult {
+    let artist_id_str = authed
+        .params
+        .id
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest(10, "Missing artist id".to_string()))?;
+    let artist_id = match artist_id_str.parse::<ItemId>() {
+        Ok(ItemId::Artist(id)) => id,
+        _ => return Err(ApiError::BadRequest(0, "Invalid artist id".to_string())),
     };
 
-    let mut client = state.tidal.lock().await;
-    match client.get_artist_detail(artist_id).await {
-        Ok(artist_detail) => {
-            let sub_artist = mapping::artist_to_subsonic(&artist_detail);
-            let mut sub_albums = Vec::new();
-            if let Ok(albums) = client.get_artist_albums(artist_id, 0, 100).await {
-                sub_albums = albums.items.iter().map(|a| mapping::album_to_subsonic(a)).collect();
-            }
-            resp.artist = Some(ArtistWithAlbums {
-                id: sub_artist.id,
-                name: sub_artist.name,
-                cover_art: sub_artist.cover_art,
-                album_count: Some(sub_albums.len() as u32),
-                artist_image_url: sub_artist.artist_image_url,
-                starred: None,
-                album: sub_albums,
-            });
-        }
-        Err(e) => {
-            resp.error = Some(SubsonicError { code: 0, message: e });
-            resp.status = "failed".to_string();
-        }
+    let client = authed.tidal();
+    let artist_detail = client
+        .get_artist_detail(artist_id)
+        .await
+        .map_err(ApiError::Tidal)?;
+    let sub_artist = mapping::artist_to_subsonic(&artist_detail);
+    let mut sub_albums = Vec::new();
+    if let Ok(albums) = client.get_artist_albums(artist_id, 0, 100).await {
+        sub_albums = albums.items.iter().map(|a| mapping::album_to_subsonic(a)).collect();
     }
-    respond(&resp, &params)
+    Ok(Payload::Artist(ArtistWithAlbums {
+        id: sub_artist.id,
+        name: sub_artist.name,
+        cover_art: sub_artist.cover_art,
+        album_count: Some(sub_albums.len() as u32),
+        artist_image_url: sub_artist.artist_image_url,
+        starred: None,
+        album: sub_albums,
+    })
+    .into())
 }
 
-async fn handle_get_album(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-    headers: HeaderMap,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let mut resp = xml_ok();
-    let album_id_str = match &params.id {
-        Some(id) => id.clone(),
-        None => return respond(&xml_error(10, "Missing album id"), &params),
-    };
-    let album_id: u64 = match album_id_str.strip_prefix("al-").and_then(|s| s.parse().ok()) {
-        Some(id) => id,
-        None => return respond(&xml_error(0, "Invalid album id"), &params),
+async fn handle_get_album(authed: Authed, headers: HeaderMap) -> ApiResult {
+    let album_id_str = authed
+        .params
+        .id
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest(10, "Missing album id".to_string()))?;
+    let album_id = match album_id_str.parse::<ItemId>() {
+        Ok(ItemId::Album(id)) => id,
+        _ => return Err(ApiError::BadRequest(0, "Invalid album id".to_string())),
     };
 
-    let mut client = state.tidal.lock().await;
+    let client = authed.tidal();
     let base_url = base_url_from_headers(&headers);
-    match client.get_album_detail(album_id).await {
-        Ok(album) => {
-            match client.get_album_tracks(album_id, 0, 200).await {
-                Ok(tracks) => {
-                    resp.album = Some(mapping::album_detail_to_album_with_songs(
-                        &album, &tracks.items, &base_url,
-                    ));
-                }
-                Err(_e) => {
-                    // Still return album without tracks
-                    resp.album = Some(mapping::album_detail_to_album_with_songs(
-                        &album, &[], &base_url,
-                    ));
-                }
-            }
-        }
-        Err(e) => {
-            resp.error = Some(SubsonicError { code: 0, message: e });
-            resp.status = "failed".to_string();
-        }
-    }
-    respond(&resp, &params)
+    let album = client
+        .get_album_detail(album_id)
+        .await
+        .map_err(ApiError::Tidal)?;
+    let payload = match client.get_album_tracks(album_id, 0, 200).await {
+        Ok(tracks) => Payload::Album(mapping::album_detail_to_album_with_songs(
+            &album,
+            &tracks.items,
+            &base_url,
+        )),
+        // Still return album without tracks
+        Err(_e) => Payload::Album(mapping::album_detail_to_album_with_songs(
+            &album, &[], &base_url,
+        )),
+    };
+    Ok(payload.into())
 }
 
 /// Classic browsing endpoint used by older clients (e.g. Submariner). An
 /// artist id (`ar-`) lists its albums as sub-directories; an album id (`al-`)
 /// lists its tracks as songs — matching what getArtist / getAlbum return but in
 /// the directory shape those clients navigate with.
-async fn handle_get_music_directory(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-    headers: HeaderMap,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let mut resp = xml_ok();
-    let dir_id = match &params.id {
-        Some(id) => id.clone(),
-        None => return respond(&xml_error(10, "Missing directory id"), &params),
-    };
+async fn handle_get_music_directory(authed: Authed, headers: HeaderMap) -> ApiResult {
+    let dir_id = authed
+        .params
+        .id
+        .clone()
+        .ok_or_else(|| ApiError::BadRequest(10, "Missing directory id".to_string()))?;
     let base_url = base_url_from_headers(&headers);
-    let mut client = state.tidal.lock().await;
+    let client = authed.tidal();
 
-    if let Some(artist_id) = dir_id.strip_prefix("ar-").and_then(|s| s.parse::<u64>().ok()) {
-        match client.get_artist_detail(artist_id).await {
-            Ok(artist) => {
-                let mut children = Vec::new();
-                if let Ok(albums) = client.get_artist_albums(artist_id, 0, 100).await {
-                    children = albums
-                        .items
-                        .iter()
-                        .map(|a| mapping::album_to_directory_child(a, &dir_id))
-                        .collect();
-                }
-                resp.directory = Some(Directory {
-                    id: dir_id.clone(),
-                    name: artist.name,
-                    parent: None,
-                    play_count: None,
-                    child: children,
-                });
-            }
-            Err(e) => {
-                resp.error = Some(SubsonicError { code: 0, message: e });
-                resp.status = "failed".to_string();
-            }
-        }
-    } else if let Some(album_id) = dir_id.strip_prefix("al-").and_then(|s| s.parse::<u64>().ok()) {
-        match client.get_album_detail(album_id).await {
-            Ok(album) => {
-                let tracks = client
-                    .get_album_tracks(album_id, 0, 200)
-                    .await
-                    .map(|t| t.items)
-                    .unwrap_or_default();
-                let children = tracks
+    match dir_id.parse::<ItemId>() {
+        Ok(ItemId::Artist(artist_id)) => {
+            let artist = client
+                .get_artist_detail(artist_id)
+                .await
+                .map_err(ApiError::Tidal)?;
+            let mut children = Vec::new();
+            if let Ok(albums) = client.get_artist_albums(artist_id, 0, 100).await {
+                children = albums
+                    .items
                     .iter()
-                    .map(|t| mapping::track_to_child(t, &base_url))
+                    .map(|a| mapping::album_to_directory_child(a, &dir_id))
                     .collect();
-                let artist_parent = album
-                    .artist
-                    .as_ref()
-                    .map(|a| format!("ar-{}", a.id))
-                    .or_else(|| {
-                        album
-                            .artists
-                            .as_ref()
-                            .and_then(|a| a.first())
-                            .map(|a| format!("ar-{}", a.id))
-                    });
-                resp.directory = Some(Directory {
-                    id: dir_id.clone(),
-                    name: album.title.clone(),
-                    parent: artist_parent,
-                    play_count: None,
-                    child: children,
-                });
             }
-            Err(e) => {
-                resp.error = Some(SubsonicError { code: 0, message: e });
-                resp.status = "failed".to_string();
-            }
+            Ok(Payload::Directory(Directory {
+                id: dir_id.clone(),
+                name: artist.name,
+                parent: None,
+                play_count: None,
+                child: children,
+            })
+            .into())
         }
-    } else {
-        return respond(&xml_error(70, "Directory not found"), &params);
-    }
-
-    respond(&resp, &params)
-}
-
-async fn handle_get_song(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-    headers: HeaderMap,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let mut resp = xml_ok();
-    let track_id_str = match &params.id {
-        Some(id) => id.clone(),
-        None => return respond(&xml_error(10, "Missing track id"), &params),
-    };
-    let track_id: u64 = match track_id_str.strip_prefix("tr-").and_then(|s| s.parse().ok()) {
-        Some(id) => id,
-        None => return respond(&xml_error(0, "Invalid track id"), &params),
-    };
-
-    let mut client = state.tidal.lock().await;
-    match client.get_track(track_id).await {
-        Ok(track) => {
-            let base_url = base_url_from_headers(&headers);
-            resp.song = Some(mapping::track_to_child(&track, &base_url));
-        }
-        Err(e) => {
-            resp.error = Some(SubsonicError { code: 0, message: e });
-            resp.status = "failed".to_string();
-        }
-    }
-    respond(&resp, &params)
-}
-
-async fn handle_get_random_songs(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-    headers: HeaderMap,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let mut resp = xml_ok();
-    let size = params.size.unwrap_or(10).min(50);
-    let mut client = state.tidal.lock().await;
-    let user_id = match client.user_id() {
-        Some(id) => id,
-        None => {
-            return respond(&xml_error(0, "Not authenticated with TIDAL"), &params);
-        }
-    };
-    match client.get_favorite_tracks(user_id, 0, 200).await {
-        Ok(tracks) => {
-            // Simple "random" - just return the first N tracks (or use search for random)
-            let base_url = base_url_from_headers(&headers);
-            let count = size.min(tracks.items.len() as u32);
-            let songs: Vec<SubsonicChild> = tracks.items[..count as usize]
+        Ok(ItemId::Album(album_id)) => {
+            let album = client
+                .get_album_detail(album_id)
+                .await
+                .map_err(ApiError::Tidal)?;
+            let tracks = client
+                .get_album_tracks(album_id, 0, 200)
+                .await
+                .map(|t| t.items)
+                .unwrap_or_default();
+            let children = tracks
                 .iter()
                 .map(|t| mapping::track_to_child(t, &base_url))
                 .collect();
-            resp.random_songs = Some(SongList { song: songs });
+            let (_artist_name, artist_id) = mapping::primary_artist(&album);
+            let artist_parent = artist_id.map(|id| ItemId::Artist(id).to_string());
+            Ok(Payload::Directory(Directory {
+                id: dir_id.clone(),
+                name: album.title.clone(),
+                parent: artist_parent,
+                play_count: None,
+                child: children,
+            })
+            .into())
         }
-        Err(e) => {
-            resp.error = Some(SubsonicError { code: 0, message: e });
-            resp.status = "failed".to_string();
-        }
+        _ => Err(ApiError::BadRequest(70, "Directory not found".to_string())),
     }
-    respond(&resp, &params)
+}
+
+async fn handle_get_song(authed: Authed, headers: HeaderMap) -> ApiResult {
+    let track_id_str = authed
+        .params
+        .id
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest(10, "Missing track id".to_string()))?;
+    let track_id = match track_id_str.parse::<ItemId>() {
+        Ok(ItemId::Track(id)) => id,
+        _ => return Err(ApiError::BadRequest(0, "Invalid track id".to_string())),
+    };
+
+    let client = authed.tidal();
+    let track = client.get_track(track_id).await.map_err(ApiError::Tidal)?;
+    let base_url = base_url_from_headers(&headers);
+    Ok(Payload::Song(mapping::track_to_child(&track, &base_url)).into())
+}
+
+async fn handle_get_random_songs(authed: Authed, headers: HeaderMap) -> ApiResult {
+    let size = authed.params.size.unwrap_or(10).min(50);
+    let client = authed.tidal();
+    let user_id = authed.tidal_user_id().await?;
+    let tracks = client
+        .get_favorite_tracks(user_id, 0, 200)
+        .await
+        .map_err(ApiError::Tidal)?;
+    // Simple "random" - just return the first N tracks (or use search for random)
+    let base_url = base_url_from_headers(&headers);
+    let count = size.min(tracks.items.len() as u32);
+    let songs: Vec<SubsonicChild> = tracks.items[..count as usize]
+        .iter()
+        .map(|t| mapping::track_to_child(t, &base_url))
+        .collect();
+    Ok(Payload::RandomSongs(SongList { song: songs }).into())
 }
 
 /// Fetch and order the album list for the given `type`, backed by the user's
 /// TIDAL favorites (the only broad album source available via the proxy).
 async fn fetch_album_list(
-    client: &mut TidalClient,
+    client: &TidalClient,
     list_type: &str,
     size: u32,
     offset: u32,
 ) -> Result<Vec<SubsonicAlbum>, String> {
-    let user_id = client.user_id().ok_or("Not authenticated with TIDAL")?;
+    let user_id = client.user_id().await.ok_or("Not authenticated with TIDAL")?;
     // Favorites come back ordered by date added (DESC), which matches
     // newest/recent well; other types reorder the same set client-side.
     let albums = client.get_favorite_albums(user_id, offset, size).await?;
@@ -646,66 +571,29 @@ async fn fetch_album_list(
     Ok(sub_albums)
 }
 
-async fn handle_get_album_list(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let mut resp = xml_ok();
-    let list_type = params.list_type.as_deref().unwrap_or("alphabeticalByName");
-    let size = params.size.unwrap_or(10).min(500);
-    let offset = params.offset.unwrap_or(0);
-    let mut client = state.tidal.lock().await;
-    match fetch_album_list(&mut client, list_type, size, offset).await {
-        Ok(sub_albums) => resp.album_list = Some(AlbumList { album: sub_albums }),
-        Err(e) => {
-            resp.error = Some(SubsonicError { code: 0, message: e });
-            resp.status = "failed".to_string();
-        }
-    }
-    respond(&resp, &params)
+async fn handle_get_album_list(authed: Authed) -> ApiResult {
+    let list_type = authed.params.list_type.as_deref().unwrap_or("alphabeticalByName");
+    let size = authed.params.size.unwrap_or(10).min(500);
+    let offset = authed.params.offset.unwrap_or(0);
+    let sub_albums = fetch_album_list(authed.tidal(), list_type, size, offset)
+        .await
+        .map_err(ApiError::Tidal)?;
+    Ok(Payload::AlbumList(AlbumList { album: sub_albums }).into())
 }
 
-async fn handle_get_album_list2(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let mut resp = xml_ok();
-    let list_type = params.list_type.as_deref().unwrap_or("alphabeticalByName");
-    let size = params.size.unwrap_or(10).min(500);
-    let offset = params.offset.unwrap_or(0);
-    let mut client = state.tidal.lock().await;
-    match fetch_album_list(&mut client, list_type, size, offset).await {
-        Ok(sub_albums) => resp.album_list2 = Some(AlbumList { album: sub_albums }),
-        Err(e) => {
-            resp.error = Some(SubsonicError { code: 0, message: e });
-            resp.status = "failed".to_string();
-        }
-    }
-    respond(&resp, &params)
+async fn handle_get_album_list2(authed: Authed) -> ApiResult {
+    let list_type = authed.params.list_type.as_deref().unwrap_or("alphabeticalByName");
+    let size = authed.params.size.unwrap_or(10).min(500);
+    let offset = authed.params.offset.unwrap_or(0);
+    let sub_albums = fetch_album_list(authed.tidal(), list_type, size, offset)
+        .await
+        .map_err(ApiError::Tidal)?;
+    Ok(Payload::AlbumList2(AlbumList { album: sub_albums }).into())
 }
 
-async fn handle_get_starred(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-    headers: HeaderMap,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let mut resp = xml_ok();
-    let mut client = state.tidal.lock().await;
-    let user_id = match client.user_id() {
-        Some(id) => id,
-        None => {
-            return respond(&xml_error(0, "Not authenticated with TIDAL"), &params);
-        }
-    };
+async fn handle_get_starred(authed: Authed, headers: HeaderMap) -> ApiResult {
+    let client = authed.tidal();
+    let user_id = authed.tidal_user_id().await?;
     let base_url = base_url_from_headers(&headers);
 
     // Fetch starred tracks, albums, and artists
@@ -731,36 +619,23 @@ async fn handle_get_starred(
         );
     }
 
-    resp.starred = Some(starred);
-
-    // Also populate starred2 for v2 clients
-    resp.starred2 = Some(Starred2 {
-        artist: resp.starred.as_ref().and_then(|s| s.artist.clone()),
-        album: resp.starred.as_ref().and_then(|s| s.album.clone()),
-        song: resp.starred.as_ref().and_then(|s| s.song.clone()),
-    });
-
-    respond(&resp, &params)
+    // Also populate starred2 for v2 clients, mirroring the same items.
+    let starred2 = Starred2 {
+        artist: starred.artist.clone(),
+        album: starred.album.clone(),
+        song: starred.song.clone(),
+    };
+    Ok(Payload::Starred(starred, starred2).into())
 }
 
-/// Collect the targets a star/unstar request refers to, as (kind, tidal_id)
-/// pairs. `id` may be a song/album/artist (distinguished by its prefix), while
-/// `albumId` and `artistId` are explicitly typed.
-fn collect_star_targets(params: &SubsonicParams) -> Vec<(&'static str, u64)> {
+/// Collect the targets a star/unstar request refers to, as typed `ItemId`s.
+/// `id` may be a song/album/artist (distinguished by its prefix), while
+/// `albumId` and `artistId` are explicitly typed. Unparseable ids are skipped.
+fn collect_star_targets(params: &SubsonicParams) -> Vec<ItemId> {
     let mut out = Vec::new();
     let mut push = |prefixed: &str| {
-        if let Some(rest) = prefixed.strip_prefix("tr-") {
-            if let Ok(id) = rest.parse() {
-                out.push(("track", id));
-            }
-        } else if let Some(rest) = prefixed.strip_prefix("al-") {
-            if let Ok(id) = rest.parse() {
-                out.push(("album", id));
-            }
-        } else if let Some(rest) = prefixed.strip_prefix("ar-") {
-            if let Ok(id) = rest.parse() {
-                out.push(("artist", id));
-            }
+        if let Ok(item) = prefixed.parse::<ItemId>() {
+            out.push(item);
         }
     };
 
@@ -778,310 +653,216 @@ fn collect_star_targets(params: &SubsonicParams) -> Vec<(&'static str, u64)> {
     out
 }
 
-async fn handle_star(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let targets = collect_star_targets(&params);
-    let mut client = state.tidal.lock().await;
-    for (kind, id) in targets {
-        let res = match kind {
-            "track" => client.add_favorite_track(id).await,
-            "album" => client.add_favorite_album(id).await,
-            "artist" => client.add_favorite_artist(id).await,
-            _ => Ok(()),
+async fn handle_star(authed: Authed) -> ApiResult {
+    let targets = collect_star_targets(&authed.params);
+    let client = authed.tidal();
+    for target in targets {
+        let res = match target {
+            ItemId::Track(id) => client.add_favorite_track(id).await,
+            ItemId::Album(id) => client.add_favorite_album(id).await,
+            ItemId::Artist(id) => client.add_favorite_artist(id).await,
+            ItemId::Playlist(_) => Ok(()),
         };
-        if let Err(e) = res {
-            return respond(&xml_error(0, &format!("Star failed: {}", e)), &params);
-        }
+        res.map_err(|e| ApiError::Tidal(format!("Star failed: {}", e)))?;
     }
-    respond(&xml_ok(), &params)
+    Ok(ApiOk(xml_ok()))
 }
 
-async fn handle_unstar(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let targets = collect_star_targets(&params);
-    let mut client = state.tidal.lock().await;
-    for (kind, id) in targets {
-        let res = match kind {
-            "track" => client.remove_favorite_track(id).await,
-            "album" => client.remove_favorite_album(id).await,
-            "artist" => client.remove_favorite_artist(id).await,
-            _ => Ok(()),
+async fn handle_unstar(authed: Authed) -> ApiResult {
+    let targets = collect_star_targets(&authed.params);
+    let client = authed.tidal();
+    for target in targets {
+        let res = match target {
+            ItemId::Track(id) => client.remove_favorite_track(id).await,
+            ItemId::Album(id) => client.remove_favorite_album(id).await,
+            ItemId::Artist(id) => client.remove_favorite_artist(id).await,
+            ItemId::Playlist(_) => Ok(()),
         };
-        if let Err(e) = res {
-            return respond(&xml_error(0, &format!("Unstar failed: {}", e)), &params);
-        }
+        res.map_err(|e| ApiError::Tidal(format!("Unstar failed: {}", e)))?;
     }
-    respond(&xml_ok(), &params)
+    Ok(ApiOk(xml_ok()))
 }
 
-async fn handle_search2(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-    headers: HeaderMap,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let mut resp = xml_ok();
-    let query = match &params.query {
+async fn handle_search2(authed: Authed, headers: HeaderMap) -> ApiResult {
+    let query = match &authed.params.query {
         Some(q) if !q.is_empty() => q.clone(),
-        _ => return respond(&xml_error(10, "Missing query"), &params),
+        _ => return Err(ApiError::BadRequest(10, "Missing query".to_string())),
     };
 
-    let artist_count = params.artist_count.unwrap_or(20);
-    let artist_offset = params.artist_offset.unwrap_or(0);
-    let album_count = params.album_count.unwrap_or(20);
-    let album_offset = params.album_offset.unwrap_or(0);
-    let song_count = params.song_count.unwrap_or(20);
-    let song_offset = params.song_offset.unwrap_or(0);
+    let artist_count = authed.params.artist_count.unwrap_or(20);
+    let artist_offset = authed.params.artist_offset.unwrap_or(0);
+    let album_count = authed.params.album_count.unwrap_or(20);
+    let album_offset = authed.params.album_offset.unwrap_or(0);
+    let song_count = authed.params.song_count.unwrap_or(20);
+    let song_offset = authed.params.song_offset.unwrap_or(0);
 
-    let mut client = state.tidal.lock().await;
-    match client.search(&query, 50).await {
-        Ok(results) => {
-            let base_url = base_url_from_headers(&headers);
-            let artists: Vec<SubsonicArtist> = results.artists[artist_offset as usize..]
-                .iter()
-                .take(artist_count as usize)
-                .map(|a| mapping::search_artist_to_subsonic(a))
-                .collect();
-            let albums: Vec<SubsonicAlbum> = results.albums[album_offset as usize..]
-                .iter()
-                .take(album_count as usize)
-                .map(|a| mapping::album_to_subsonic(a))
-                .collect();
-            let songs: Vec<SubsonicChild> = results.tracks[song_offset as usize..]
-                .iter()
-                .take(song_count as usize)
-                .map(|t| mapping::track_to_child(t, &base_url))
-                .collect();
+    let client = authed.tidal();
+    let results = client.search(&query, 50).await.map_err(ApiError::Tidal)?;
+    let base_url = base_url_from_headers(&headers);
+    let artists: Vec<SubsonicArtist> = results.artists[artist_offset as usize..]
+        .iter()
+        .take(artist_count as usize)
+        .map(|a| mapping::search_artist_to_subsonic(a))
+        .collect();
+    let albums: Vec<SubsonicAlbum> = results.albums[album_offset as usize..]
+        .iter()
+        .take(album_count as usize)
+        .map(|a| mapping::album_to_subsonic(a))
+        .collect();
+    let songs: Vec<SubsonicChild> = results.tracks[song_offset as usize..]
+        .iter()
+        .take(song_count as usize)
+        .map(|t| mapping::track_to_child(t, &base_url))
+        .collect();
 
-            resp.search_result2 = Some(SearchResult2 {
-                artist: Some(artists),
-                album: Some(albums),
-                song: Some(songs),
-            });
-        }
-        Err(e) => {
-            resp.error = Some(SubsonicError { code: 0, message: e });
-            resp.status = "failed".to_string();
-        }
-    }
-    respond(&resp, &params)
+    Ok(Payload::SearchResult2(SearchResult2 {
+        artist: Some(artists),
+        album: Some(albums),
+        song: Some(songs),
+    })
+    .into())
 }
 
-async fn handle_search3(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-    headers: HeaderMap,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let mut resp = xml_ok();
-    let query = match &params.query {
+async fn handle_search3(authed: Authed, headers: HeaderMap) -> ApiResult {
+    let query = match &authed.params.query {
         Some(q) if !q.is_empty() => q.clone(),
-        _ => return respond(&xml_error(10, "Missing query"), &params),
+        _ => return Err(ApiError::BadRequest(10, "Missing query".to_string())),
     };
 
-    let artist_count = params.artist_count.unwrap_or(20);
-    let artist_offset = params.artist_offset.unwrap_or(0);
-    let album_count = params.album_count.unwrap_or(20);
-    let album_offset = params.album_offset.unwrap_or(0);
-    let song_count = params.song_count.unwrap_or(20);
-    let song_offset = params.song_offset.unwrap_or(0);
+    let artist_count = authed.params.artist_count.unwrap_or(20);
+    let artist_offset = authed.params.artist_offset.unwrap_or(0);
+    let album_count = authed.params.album_count.unwrap_or(20);
+    let album_offset = authed.params.album_offset.unwrap_or(0);
+    let song_count = authed.params.song_count.unwrap_or(20);
+    let song_offset = authed.params.song_offset.unwrap_or(0);
 
-    let mut client = state.tidal.lock().await;
-    match client.search(&query, 50).await {
-        Ok(results) => {
-            let base_url = base_url_from_headers(&headers);
-            let artists: Vec<SubsonicArtist> = results.artists[artist_offset as usize..]
-                .iter()
-                .take(artist_count as usize)
-                .map(|a| mapping::search_artist_to_subsonic(a))
-                .collect();
-            let albums: Vec<SubsonicAlbum> = results.albums[album_offset as usize..]
-                .iter()
-                .take(album_count as usize)
-                .map(|a| mapping::album_to_subsonic(a))
-                .collect();
-            let songs: Vec<SubsonicChild> = results.tracks[song_offset as usize..]
-                .iter()
-                .take(song_count as usize)
-                .map(|t| mapping::track_to_child(t, &base_url))
-                .collect();
+    let client = authed.tidal();
+    let results = client.search(&query, 50).await.map_err(ApiError::Tidal)?;
+    let base_url = base_url_from_headers(&headers);
+    let artists: Vec<SubsonicArtist> = results.artists[artist_offset as usize..]
+        .iter()
+        .take(artist_count as usize)
+        .map(|a| mapping::search_artist_to_subsonic(a))
+        .collect();
+    let albums: Vec<SubsonicAlbum> = results.albums[album_offset as usize..]
+        .iter()
+        .take(album_count as usize)
+        .map(|a| mapping::album_to_subsonic(a))
+        .collect();
+    let songs: Vec<SubsonicChild> = results.tracks[song_offset as usize..]
+        .iter()
+        .take(song_count as usize)
+        .map(|t| mapping::track_to_child(t, &base_url))
+        .collect();
 
-            resp.search_result3 = Some(SearchResult3 {
-                artist: Some(artists),
-                album: Some(albums),
-                song: Some(songs),
-            });
-        }
-        Err(e) => {
-            resp.error = Some(SubsonicError { code: 0, message: e });
-            resp.status = "failed".to_string();
-        }
-    }
-    respond(&resp, &params)
+    Ok(Payload::SearchResult3(SearchResult3 {
+        artist: Some(artists),
+        album: Some(albums),
+        song: Some(songs),
+    })
+    .into())
 }
 
-async fn handle_get_playlists(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let mut resp = xml_ok();
-    let mut client = state.tidal.lock().await;
-    let user_id = match client.user_id() {
-        Some(id) => id,
-        None => {
-            return respond(&xml_error(0, "Not authenticated with TIDAL"), &params);
-        }
-    };
-
-    match client.get_user_playlists(user_id, 0, 200).await {
-        Ok(playlists) => {
-            let sub_playlists: Vec<SubsonicPlaylist> = playlists
-                .items
-                .iter()
-                .map(|p| mapping::playlist_to_subsonic(p))
-                .collect();
-            resp.playlists = Some(PlaylistsWrapper {
-                playlist: sub_playlists,
-            });
-        }
-        Err(e) => {
-            resp.error = Some(SubsonicError { code: 0, message: e });
-            resp.status = "failed".to_string();
-        }
-    }
-    respond(&resp, &params)
+async fn handle_get_playlists(authed: Authed) -> ApiResult {
+    let client = authed.tidal();
+    let user_id = authed.tidal_user_id().await?;
+    let playlists = client
+        .get_user_playlists(user_id, 0, 200)
+        .await
+        .map_err(ApiError::Tidal)?;
+    let sub_playlists: Vec<SubsonicPlaylist> = playlists
+        .items
+        .iter()
+        .map(|p| mapping::playlist_to_subsonic(p))
+        .collect();
+    Ok(Payload::Playlists(PlaylistsWrapper {
+        playlist: sub_playlists,
+    })
+    .into())
 }
 
-async fn handle_get_playlist(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-    headers: HeaderMap,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let mut resp = xml_ok();
-    let playlist_id_str = match &params.id {
-        Some(id) => id.clone(),
-        None => return respond(&xml_error(10, "Missing playlist id"), &params),
-    };
-    let playlist_uuid = match playlist_id_str.strip_prefix("pl-") {
-        Some(uuid) => uuid.to_string(),
-        None => return respond(&xml_error(0, "Invalid playlist id"), &params),
+async fn handle_get_playlist(authed: Authed, headers: HeaderMap) -> ApiResult {
+    let playlist_id_str = authed
+        .params
+        .id
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest(10, "Missing playlist id".to_string()))?;
+    let playlist_uuid = match playlist_id_str.parse::<ItemId>() {
+        Ok(ItemId::Playlist(uuid)) => uuid,
+        _ => return Err(ApiError::BadRequest(0, "Invalid playlist id".to_string())),
     };
 
-    let mut client = state.tidal.lock().await;
+    let client = authed.tidal();
     // Fetch playlist metadata (name/owner/cover) alongside its tracks.
     let meta = client.get_playlist(&playlist_uuid).await.ok();
-    match client.get_playlist_tracks(&playlist_uuid, 0, 500).await {
-        Ok(tracks) => {
-            let base_url = base_url_from_headers(&headers);
-            let songs: Vec<SubsonicChild> = tracks
-                .items
-                .iter()
-                .map(|t| mapping::track_to_child(t, &base_url))
-                .collect();
-            let cover_art = meta
-                .as_ref()
-                .map(mapping::playlist_to_subsonic)
-                .and_then(|p| p.cover_art)
-                .or_else(|| songs.first().and_then(|s| s.cover_art.clone()));
-            resp.playlist = Some(PlaylistWithSongs {
-                id: format!("pl-{}", playlist_uuid),
-                name: meta
-                    .as_ref()
-                    .map(|p| p.title.clone())
-                    .unwrap_or_else(|| "Playlist".to_string()),
-                comment: meta.as_ref().and_then(|p| p.description.clone()),
-                owner: meta
-                    .as_ref()
-                    .and_then(|p| p.creator.as_ref())
-                    .and_then(|c| c.name.clone()),
-                public: meta.as_ref().and_then(|p| p.public_playlist),
-                song_count: Some(songs.len() as u32),
-                duration: meta.as_ref().and_then(|p| p.duration),
-                created: meta.as_ref().and_then(|p| p.created.clone()),
-                changed: meta.as_ref().and_then(|p| p.last_updated.clone()),
-                cover_art,
-                entry: songs,
-            });
-        }
-        Err(e) => {
-            resp.error = Some(SubsonicError { code: 0, message: e });
-            resp.status = "failed".to_string();
-        }
-    }
-    respond(&resp, &params)
+    let tracks = client
+        .get_playlist_tracks(&playlist_uuid, 0, 500)
+        .await
+        .map_err(ApiError::Tidal)?;
+    let base_url = base_url_from_headers(&headers);
+    let songs: Vec<SubsonicChild> = tracks
+        .items
+        .iter()
+        .map(|t| mapping::track_to_child(t, &base_url))
+        .collect();
+    let cover_art = meta
+        .as_ref()
+        .map(mapping::playlist_to_subsonic)
+        .and_then(|p| p.cover_art)
+        .or_else(|| songs.first().and_then(|s| s.cover_art.clone()));
+    Ok(Payload::Playlist(PlaylistWithSongs {
+        id: ItemId::Playlist(playlist_uuid.clone()).to_string(),
+        name: meta
+            .as_ref()
+            .map(|p| p.title.clone())
+            .unwrap_or_else(|| "Playlist".to_string()),
+        comment: meta.as_ref().and_then(|p| p.description.clone()),
+        owner: meta
+            .as_ref()
+            .and_then(|p| p.creator.as_ref())
+            .and_then(|c| c.name.clone()),
+        public: meta.as_ref().and_then(|p| p.public_playlist),
+        song_count: Some(songs.len() as u32),
+        duration: meta.as_ref().and_then(|p| p.duration),
+        created: meta.as_ref().and_then(|p| p.created.clone()),
+        changed: meta.as_ref().and_then(|p| p.last_updated.clone()),
+        cover_art,
+        entry: songs,
+    })
+    .into())
 }
 
-async fn handle_create_playlist(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
+async fn handle_create_playlist(_authed: Authed) -> ApiResult {
     // Playlist creation not implemented via Subsonic API
-    let resp = xml_error(0, "Playlist creation not supported via Subsonic API. Use the TIDAL app.");
-    respond(&resp, &params)
+    Err(ApiError::Tidal(
+        "Playlist creation not supported via Subsonic API. Use the TIDAL app.".to_string(),
+    ))
 }
 
-async fn handle_update_playlist(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let resp = xml_error(0, "Playlist updates not supported via Subsonic API.");
-    respond(&resp, &params)
+async fn handle_update_playlist(_authed: Authed) -> ApiResult {
+    Err(ApiError::Tidal(
+        "Playlist updates not supported via Subsonic API.".to_string(),
+    ))
 }
 
-async fn handle_delete_playlist(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let resp = xml_error(0, "Playlist deletion not supported via Subsonic API.");
-    respond(&resp, &params)
+async fn handle_delete_playlist(_authed: Authed) -> ApiResult {
+    Err(ApiError::Tidal(
+        "Playlist deletion not supported via Subsonic API.".to_string(),
+    ))
 }
 
 // ------ Cover Art / Image proxy ------ 
 
-async fn handle_get_cover_art(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let cover_id = match &params.id {
+async fn handle_get_cover_art(authed: Authed) -> Response {
+    let state = &authed.state;
+    let cover_id = match &authed.params.id {
         Some(id) => id.clone(),
         None => {
             return (StatusCode::INTERNAL_SERVER_ERROR, "Missing cover id").into_response();
         }
     };
 
-    let size = params.size.unwrap_or(640);
+    let size = authed.params.size.unwrap_or(640);
     let candidates = mapping::cover_art_urls(&cover_id, size);
     if candidates.is_empty() {
         return (StatusCode::NOT_FOUND, "Invalid cover ID").into_response();
@@ -1090,6 +871,12 @@ async fn handle_get_cover_art(
     // TIDAL serves different size sets per image kind (album vs artist), so try
     // the size-ranked candidates until one exists on the CDN.
     for image_url in &candidates {
+        // SSRF guard: only ever fetch from TIDAL's image CDN, never a host a
+        // crafted cover id might have smuggled in.
+        if !is_allowed_cover_host(image_url) {
+            tracing::warn!("Blocked non-TIDAL cover art host: {}", image_url);
+            continue;
+        }
         match state.http_client.get(image_url).send().await {
             Ok(response) if response.status().is_success() => {
                 let content_type = response
@@ -1120,25 +907,20 @@ async fn handle_get_cover_art(
 
 // ------ Streaming ------ 
 
-async fn handle_stream(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-    headers: HeaderMap,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
+async fn handle_stream(authed: Authed, headers: HeaderMap) -> Response {
+    let state = &authed.state;
+    let params = &authed.params;
     let track_id_str = match &params.id {
         Some(id) => id.clone(),
         None => {
-            return respond(&xml_error(10, "Missing id parameter"), &params);
+            return render_current(&xml_error(10, "Missing id parameter"));
         }
     };
 
-    let track_id: u64 = match track_id_str.strip_prefix("tr-").and_then(|s| s.parse().ok()) {
-        Some(id) => id,
-        None => {
-            return respond(&xml_error(0, "Invalid track id"), &params);
+    let track_id: u64 = match track_id_str.parse::<ItemId>() {
+        Ok(ItemId::Track(id)) => id,
+        _ => {
+            return render_current(&xml_error(0, "Invalid track id"));
         }
     };
 
@@ -1175,11 +957,11 @@ async fn handle_stream(
     };
 
     let stream_info = {
-        let mut client = state.tidal.lock().await;
+        let client = &state.tidal;
         match client.get_streamable_url(track_id, ceiling).await {
             Ok(info) => info,
             Err(e) => {
-                return respond(&xml_error(0, &format!("Stream URL error: {}", e)), &params);
+                return render_current(&xml_error(0, &format!("Stream URL error: {}", e)));
             }
         }
     };
@@ -1191,6 +973,16 @@ async fn handle_stream(
         stream_info.codec,
         stream_info.segments.len(),
     );
+
+    // SSRF guard: refuse to proxy any stream/segment URL that points at an
+    // internal target. These come from TIDAL's signed manifest, but validate
+    // defensively before we make the server fetch them.
+    let all_ok = stream_info.segments.iter().all(|u| is_safe_stream_host(u))
+        && (stream_info.url.is_empty() || is_safe_stream_host(&stream_info.url));
+    if !all_ok {
+        tracing::warn!("Blocked unsafe stream host for track {}", track_id);
+        return render_current(&xml_error(0, "Refusing to proxy an unsafe stream URL"));
+    }
 
     // Segmented DASH: concatenate the ordered segments into one playable file.
     if !stream_info.segments.is_empty() {
@@ -1212,16 +1004,13 @@ async fn handle_stream(
     let upstream = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            return respond(&xml_error(0, &format!("Stream fetch error: {}", e)), &params);
+            return render_current(&xml_error(0, &format!("Stream fetch error: {}", e)));
         }
     };
 
     let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::OK);
     if !status.is_success() {
-        return respond(
-            &xml_error(0, &format!("Upstream stream error: HTTP {}", status)),
-            &params,
-        );
+        return render_current(&xml_error(0, &format!("Upstream stream error: HTTP {}", status)));
     }
 
     // Preserve the headers a Subsonic client needs for playback and seeking.
@@ -1381,28 +1170,14 @@ fn default_content_type(codec: &Option<String>) -> String {
     }
 }
 
-async fn handle_scrobble(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
+async fn handle_scrobble(_authed: Authed) -> ApiResult {
     // Scrobbling is not implemented - just acknowledge
-    let resp = xml_ok();
-    respond(&resp, &params)
+    Ok(ApiOk(xml_ok()))
 }
 
-async fn handle_get_user(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let mut resp = xml_ok();
-    resp.user = Some(SubsonicUser {
-        username: state.subsonic_username.clone(),
+async fn handle_get_user(authed: Authed) -> ApiResult {
+    Ok(Payload::User(SubsonicUser {
+        username: authed.state.subsonic_username.clone(),
         email: None,
         scrobbling_enabled: Some(false),
         admin_role: Some(true),
@@ -1419,77 +1194,44 @@ async fn handle_get_user(
         video_conversion_role: Some(false),
         avatar_last_changed: None,
         folder: None,
-    });
-    respond(&resp, &params)
+    })
+    .into())
 }
 
-async fn handle_get_scan_status(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let mut resp = xml_ok();
+async fn handle_get_scan_status(_authed: Authed) -> ApiResult {
     // There is no local library to scan — the proxy is always "done scanning".
-    resp.scan_status = Some(ScanStatus {
+    Ok(Payload::ScanStatus(ScanStatus {
         scanning: false,
         count: Some(0),
-    });
-    respond(&resp, &params)
+    })
+    .into())
 }
 
 /// `startScan` on a live proxy has nothing to scan, so we immediately report a
 /// finished scan. Clients (e.g. Submariner) poll getScanStatus afterwards and
 /// need to see `scanning=false` to consider the scan complete.
-async fn handle_start_scan(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let mut resp = xml_ok();
-    resp.scan_status = Some(ScanStatus {
+async fn handle_start_scan(_authed: Authed) -> ApiResult {
+    Ok(Payload::ScanStatus(ScanStatus {
         scanning: false,
         count: Some(0),
-    });
-    respond(&resp, &params)
+    })
+    .into())
 }
 
 /// We don't track cross-client playback, so report an empty now-playing list.
-async fn handle_get_now_playing(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let mut resp = xml_ok();
-    resp.now_playing = Some(NowPlaying { entry: vec![] });
-    respond(&resp, &params)
+async fn handle_get_now_playing(_authed: Authed) -> ApiResult {
+    Ok(Payload::NowPlaying(NowPlaying { entry: vec![] }).into())
 }
 
-async fn handle_get_genres(
-    State(state): State<AppState>,
-    Query(params): Query<SubsonicParams>,
-) -> Response {
-    if !verify_auth(&state, &params) {
-        return respond(&xml_error(40, "Wrong username or password"), &params);
-    }
-    let mut resp = xml_ok();
-    resp.genres = Some(GenresWrapper { genre: vec![] });
-    respond(&resp, &params)
+async fn handle_get_genres(_authed: Authed) -> ApiResult {
+    Ok(Payload::Genres(GenresWrapper { genre: vec![] }).into())
 }
 
-async fn handle_get_open_subsonic_extensions(
-    Query(params): Query<SubsonicParams>,
-) -> Response {
+async fn handle_get_open_subsonic_extensions(Query(params): Query<SubsonicParams>) -> Response {
     // Per the OpenSubsonic spec this discovery endpoint does not require auth.
     // We advertise no optional extensions (empty list) — enough for clients to
     // recognise us as OpenSubsonic-aware without promising unimplemented ones.
-    let mut resp = xml_ok();
-    resp.open_subsonic_extensions = Some(vec![]);
+    let resp = SubsonicResponse::ok_with(Payload::OpenSubsonicExtensions(vec![]));
     respond(&resp, &params)
 }
 
@@ -1497,6 +1239,8 @@ async fn handle_get_avatar(
     State(state): State<AppState>,
     Query(params): Query<SubsonicParams>,
 ) -> Response {
+    // Avatar keeps its own auth check: on failure it returns a plain HTTP 401
+    // (not a Subsonic-shaped body), so it must not use the `Authed` extractor.
     if !verify_auth(&state, &params) {
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
@@ -1559,6 +1303,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cover_host_allowlist() {
+        assert!(is_allowed_cover_host("https://resources.tidal.com/images/a/640x640.jpg"));
+        assert!(is_allowed_cover_host("https://foo.tidal.com/x.jpg"));
+        assert!(!is_allowed_cover_host("http://169.254.169.254/latest/meta-data/"));
+        assert!(!is_allowed_cover_host("https://evil.example.com/x.jpg"));
+        assert!(!is_allowed_cover_host("https://resources.tidal.com.evil.com/x"));
+    }
+
+    #[test]
+    fn stream_host_blocks_internal() {
+        assert!(is_safe_stream_host("https://sp-ad-fa.audio.tidal.com/mediatracks/x/0.mp4"));
+        assert!(is_safe_stream_host("https://cdn.cloudfront.net/x.mp4")); // regional CDNs allowed
+        assert!(!is_safe_stream_host("http://localhost/x"));
+        assert!(!is_safe_stream_host("http://127.0.0.1/x"));
+        assert!(!is_safe_stream_host("http://169.254.169.254/latest/meta-data/"));
+        assert!(!is_safe_stream_host("http://10.0.0.5/x"));
+        assert!(!is_safe_stream_host("http://192.168.1.1/x"));
+        assert!(!is_safe_stream_host("file:///etc/passwd"));
+    }
+
+    #[test]
     fn range_full_from_zero_is_treated_as_200() {
         // "bytes=0-" over the whole file → None so we serve a plain 200.
         assert_eq!(parse_byte_range("bytes=0-", 1000), None);
@@ -1589,6 +1354,40 @@ mod tests {
     }
 }
 
+/// Cover-art IDs are user-supplied (a base64 blob that may decode to a full
+/// URL), so getCoverArt could be steered at an arbitrary host — an SSRF vector.
+/// Restrict cover fetches to TIDAL's image CDN.
+fn is_allowed_cover_host(url: &str) -> bool {
+    match reqwest::Url::parse(url) {
+        Ok(u) => matches!(u.host_str(), Some(h) if h == "resources.tidal.com" || h.ends_with(".tidal.com")),
+        Err(_) => false,
+    }
+}
+
+/// Stream URLs come from TIDAL's own signed playbackinfo manifest, not from
+/// user input, so a strict allowlist would break legitimate regional CDNs.
+/// Instead just refuse obviously-internal targets (loopback, private, and
+/// link-local ranges — the classic SSRF pivots).
+fn is_safe_stream_host(url: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(u.scheme(), "http" | "https") {
+        return false;
+    }
+    match u.host() {
+        Some(url::Host::Domain(h)) => {
+            let h = h.to_ascii_lowercase();
+            h != "localhost" && !h.ends_with(".localhost") && !h.ends_with(".internal")
+        }
+        Some(url::Host::Ipv4(ip)) => {
+            !(ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified())
+        }
+        Some(url::Host::Ipv6(ip)) => !(ip.is_loopback() || ip.is_unspecified()),
+        None => false,
+    }
+}
+
 /// Redact sensitive Subsonic auth params (token, salt, password) from a query
 /// string before logging it.
 fn redact_query(query: &str) -> String {
@@ -1597,7 +1396,8 @@ fn redact_query(query: &str) -> String {
         .map(|pair| {
             let key = pair.split('=').next().unwrap_or("");
             match key {
-                "t" | "s" | "p" | "token" | "salt" | "password" => format!("{}=<redacted>", key),
+                "t" | "s" | "p" | "token" | "salt" | "password" | "subsonic_password"
+                | "subsonic_username" => format!("{}=<redacted>", key),
                 _ => pair.to_string(),
             }
         })
@@ -1619,8 +1419,24 @@ async fn log_requests(
         .map(redact_query)
         .filter(|q| !q.is_empty());
 
+    // Establish the response format/callback context for the whole handler
+    // execution so `ApiError`/`ApiOk` can render in the client-requested format.
+    let (format, callback) = req
+        .uri()
+        .query()
+        .map(|q| {
+            let parsed = url::form_urlencoded::parse(q.as_bytes())
+                .into_owned()
+                .collect::<std::collections::HashMap<_, _>>();
+            (
+                ResponseFormat::from_param(parsed.get("f").map(|s| s.as_str())),
+                parsed.get("callback").cloned(),
+            )
+        })
+        .unwrap_or((ResponseFormat::Xml, None));
+
     let started = std::time::Instant::now();
-    let response = next.run(req).await;
+    let response = RESPONSE_CTX.scope((format, callback), next.run(req)).await;
     let elapsed_ms = started.elapsed().as_millis();
     let status = response.status().as_u16();
 
@@ -1629,6 +1445,19 @@ async fn log_requests(
         None => tracing::info!("{} {} -> {} ({} ms)", method, path, status, elapsed_ms),
     }
     response
+}
+
+/// Register a Subsonic endpoint under both the bare `/rest/<name>` path and the
+/// legacy `/rest/<name>.view` alias (older clients append `.view`), so each
+/// endpoint only has to be listed once.
+fn rest(
+    router: axum::Router<AppState>,
+    name: &str,
+    handler: axum::routing::MethodRouter<AppState>,
+) -> axum::Router<AppState> {
+    router
+        .route(&format!("/rest/{}", name), handler.clone())
+        .route(&format!("/rest/{}.view", name), handler)
 }
 
 #[tokio::main]
@@ -1650,23 +1479,18 @@ async fn main() {
     let cfg = db::load_config(&db).await;
 
     // Create TidalClient with DB-backed tokens
-    let tidal = Arc::new(tokio::sync::Mutex::new(TidalClient::from_db_config(&cfg)));
+    let tidal: SharedTidalClient = Arc::new(TidalClient::from_db_config(&cfg, db.clone()));
 
     // If we have tokens but no user_id, try to get session info
-    {
-        let mut client = tidal.lock().await;
-        if client.is_authenticated() && client.user_id().is_none() {
-            tracing::info!("Authenticated, fetching session info...");
-            match client.get_session_info().await {
-                Ok(uid) => {
-                    tracing::info!("Logged in as user {}", uid);
-                    db::save_tokens(&db, &client.access_token, &client.refresh_token, Some(uid), &client.country_code)
-                        .await
-                        .ok();
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to get session info: {} - will try again on first API call", e);
-                }
+    if tidal.is_authenticated().await && tidal.user_id().await.is_none() {
+        tracing::info!("Authenticated, fetching session info...");
+        // get_session_info persists the discovered user_id / country_code itself.
+        match tidal.get_session_info().await {
+            Ok(uid) => {
+                tracing::info!("Logged in as user {}", uid);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to get session info: {} - will try again on first API call", e);
             }
         }
     }
@@ -1692,73 +1516,48 @@ async fn main() {
         max_quality: max_quality.clone(),
     };
 
-    let app = auth::auth_routes()
-        .route("/rest/ping", get(handle_ping))
-        .route("/rest/ping.view", get(handle_ping))
-        .route("/rest/getLicense", get(handle_get_license))
-        .route("/rest/getLicense.view", get(handle_get_license))
-        .route("/rest/getMusicFolders", get(handle_get_music_folders))
-        .route("/rest/getMusicFolders.view", get(handle_get_music_folders))
-        .route("/rest/getIndexes", get(handle_get_indexes))
-        .route("/rest/getIndexes.view", get(handle_get_indexes))
-        .route("/rest/getArtists", get(handle_get_artists))
-        .route("/rest/getArtists.view", get(handle_get_artists))
-        .route("/rest/getArtist", get(handle_get_artist))
-        .route("/rest/getArtist.view", get(handle_get_artist))
-        .route("/rest/getMusicDirectory", get(handle_get_music_directory))
-        .route("/rest/getMusicDirectory.view", get(handle_get_music_directory))
-        .route("/rest/getAlbum", get(handle_get_album))
-        .route("/rest/getAlbum.view", get(handle_get_album))
-        .route("/rest/getSong", get(handle_get_song))
-        .route("/rest/getSong.view", get(handle_get_song))
-        .route("/rest/getRandomSongs", get(handle_get_random_songs))
-        .route("/rest/getRandomSongs.view", get(handle_get_random_songs))
-        .route("/rest/getAlbumList", get(handle_get_album_list))
-        .route("/rest/getAlbumList.view", get(handle_get_album_list))
-        .route("/rest/getAlbumList2", get(handle_get_album_list2))
-        .route("/rest/getAlbumList2.view", get(handle_get_album_list2))
-        .route("/rest/getStarred", get(handle_get_starred))
-        .route("/rest/getStarred.view", get(handle_get_starred))
-        .route("/rest/getStarred2", get(handle_get_starred))
-        .route("/rest/getStarred2.view", get(handle_get_starred))
-        .route("/rest/star", get(handle_star))
-        .route("/rest/star.view", get(handle_star))
-        .route("/rest/unstar", get(handle_unstar))
-        .route("/rest/unstar.view", get(handle_unstar))
-        .route("/rest/search2", get(handle_search2))
-        .route("/rest/search2.view", get(handle_search2))
-        .route("/rest/search3", get(handle_search3))
-        .route("/rest/search3.view", get(handle_search3))
-        .route("/rest/getPlaylists", get(handle_get_playlists))
-        .route("/rest/getPlaylists.view", get(handle_get_playlists))
-        .route("/rest/getPlaylist", get(handle_get_playlist))
-        .route("/rest/getPlaylist.view", get(handle_get_playlist))
-        .route("/rest/createPlaylist", get(handle_create_playlist))
-        .route("/rest/createPlaylist.view", get(handle_create_playlist))
-        .route("/rest/updatePlaylist", get(handle_update_playlist))
-        .route("/rest/updatePlaylist.view", get(handle_update_playlist))
-        .route("/rest/deletePlaylist", get(handle_delete_playlist))
-        .route("/rest/deletePlaylist.view", get(handle_delete_playlist))
-        .route("/rest/getCoverArt", get(handle_get_cover_art))
-        .route("/rest/getCoverArt.view", get(handle_get_cover_art))
-        .route("/rest/stream", get(handle_stream))
-        .route("/rest/stream.view", get(handle_stream))
-        .route("/rest/scrobble", get(handle_scrobble))
-        .route("/rest/scrobble.view", get(handle_scrobble))
-        .route("/rest/getUser", get(handle_get_user))
-        .route("/rest/getUser.view", get(handle_get_user))
-        .route("/rest/getScanStatus", get(handle_get_scan_status))
-        .route("/rest/getScanStatus.view", get(handle_get_scan_status))
-        .route("/rest/startScan", get(handle_start_scan))
-        .route("/rest/startScan.view", get(handle_start_scan))
-        .route("/rest/getGenres", get(handle_get_genres))
-        .route("/rest/getGenres.view", get(handle_get_genres))
-        .route("/rest/getNowPlaying", get(handle_get_now_playing))
-        .route("/rest/getNowPlaying.view", get(handle_get_now_playing))
-        .route("/rest/getOpenSubsonicExtensions", get(handle_get_open_subsonic_extensions))
-        .route("/rest/getOpenSubsonicExtensions.view", get(handle_get_open_subsonic_extensions))
-        .route("/rest/getAvatar", get(handle_get_avatar))
-        .route("/rest/getAvatar.view", get(handle_get_avatar))
+    let mut app = auth::auth_routes();
+    // Each endpoint is registered under both `/rest/<name>` and its `.view`
+    // alias via `rest`, so the list below stays one line per endpoint.
+    for (name, handler) in [
+        ("ping", get(handle_ping)),
+        ("getLicense", get(handle_get_license)),
+        ("getMusicFolders", get(handle_get_music_folders)),
+        ("getIndexes", get(handle_get_indexes)),
+        ("getArtists", get(handle_get_artists)),
+        ("getArtist", get(handle_get_artist)),
+        ("getMusicDirectory", get(handle_get_music_directory)),
+        ("getAlbum", get(handle_get_album)),
+        ("getSong", get(handle_get_song)),
+        ("getRandomSongs", get(handle_get_random_songs)),
+        ("getAlbumList", get(handle_get_album_list)),
+        ("getAlbumList2", get(handle_get_album_list2)),
+        ("getStarred", get(handle_get_starred)),
+        ("getStarred2", get(handle_get_starred)),
+        ("star", get(handle_star)),
+        ("unstar", get(handle_unstar)),
+        ("search2", get(handle_search2)),
+        ("search3", get(handle_search3)),
+        ("getPlaylists", get(handle_get_playlists)),
+        ("getPlaylist", get(handle_get_playlist)),
+        ("createPlaylist", get(handle_create_playlist)),
+        ("updatePlaylist", get(handle_update_playlist)),
+        ("deletePlaylist", get(handle_delete_playlist)),
+        ("getCoverArt", get(handle_get_cover_art)),
+        ("stream", get(handle_stream)),
+        ("scrobble", get(handle_scrobble)),
+        ("getUser", get(handle_get_user)),
+        ("getScanStatus", get(handle_get_scan_status)),
+        ("startScan", get(handle_start_scan)),
+        ("getGenres", get(handle_get_genres)),
+        ("getNowPlaying", get(handle_get_now_playing)),
+        ("getOpenSubsonicExtensions", get(handle_get_open_subsonic_extensions)),
+        ("getAvatar", get(handle_get_avatar)),
+    ] {
+        app = rest(app, name, handler);
+    }
+
+    let app = app
         .fallback(handle_not_implemented)
         .layer(axum::middleware::from_fn(log_requests))
         .layer(TraceLayer::new_for_http())

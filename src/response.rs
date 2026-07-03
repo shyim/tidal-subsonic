@@ -137,60 +137,27 @@ mod tests {
     use super::*;
     use crate::subsonic::*;
 
-    fn base() -> SubsonicResponse {
-        SubsonicResponse {
-            xmlns: "http://subsonic.org/restapi".into(),
-            status: "ok".into(),
-            version: "1.16.1".into(),
-            server_type: "tidal-subsonic".into(),
-            server_version: "0.1.0".into(),
-            open_subsonic: true,
-            error: None,
-            license: None,
-            music_folders: None,
-            indexes: None,
-            artists: None,
-            artist: None,
-            album: None,
-            song: None,
-            album_list: None,
-            album_list2: None,
-            random_songs: None,
-            songs_by_genre: None,
-            now_playing: None,
+    fn sample_album() -> SubsonicAlbum {
+        SubsonicAlbum {
+            id: "al-1".into(),
+            name: "Test".into(),
+            artist: Some("Artist".into()),
+            artist_id: Some("ar-2".into()),
+            cover_art: None,
+            song_count: Some(10),
+            duration: Some(2400),
+            created: None,
+            year: Some(2020),
+            genre: None,
             starred: None,
-            starred2: None,
-            search_result: None,
-            search_result2: None,
-            search_result3: None,
-            playlists: None,
-            playlist: None,
-            user: None,
-            scan_status: None,
-            genres: None,
-            open_subsonic_extensions: None,
-            directory: None,
         }
     }
 
     #[test]
     fn json_strips_attribute_prefixes() {
-        let mut resp = base();
-        resp.album_list = Some(AlbumList {
-            album: vec![SubsonicAlbum {
-                id: "al-1".into(),
-                name: "Test".into(),
-                artist: Some("Artist".into()),
-                artist_id: Some("ar-2".into()),
-                cover_art: None,
-                song_count: Some(10),
-                duration: Some(2400),
-                created: None,
-                year: Some(2020),
-                genre: None,
-                starred: None,
-            }],
-        });
+        let resp = SubsonicResponse::ok_with(Payload::AlbumList(AlbumList {
+            album: vec![sample_album()],
+        }));
 
         let json = serialize_to_json(&resp);
         let v: Value = serde_json::from_str(&json).unwrap();
@@ -205,17 +172,145 @@ mod tests {
 
     #[test]
     fn json_wraps_root_and_carries_error() {
-        let mut resp = base();
-        resp.status = "failed".into();
-        resp.error = Some(SubsonicError {
-            code: 40,
-            message: "Wrong username or password".into(),
-        });
+        let resp = SubsonicResponse::error(40, "Wrong username or password");
         let v: Value = serde_json::from_str(&serialize_to_json(&resp)).unwrap();
+        assert_eq!(v["subsonic-response"]["status"], "failed");
         assert_eq!(v["subsonic-response"]["error"]["code"], 40);
         assert_eq!(
             v["subsonic-response"]["error"]["message"],
             "Wrong username or password"
         );
+    }
+
+    // ------ Round-trip: the payload enum must reproduce the exact historical
+    // wire names in BOTH JSON keys and XML elements. ------
+
+    #[test]
+    fn ping_ok_has_no_payload() {
+        let resp = SubsonicResponse::ok();
+        let xml = serialize_to_xml(&resp);
+        let v: Value = serde_json::from_str(&serialize_to_json(&resp)).unwrap();
+        let obj = v["subsonic-response"].as_object().unwrap();
+        // status + the five other fixed attrs only, no error, no payload.
+        assert_eq!(obj["status"], "ok");
+        assert!(obj.get("error").is_none());
+        assert_eq!(obj.len(), 6, "unexpected payload keys: {obj:?}");
+        assert!(xml.contains("<subsonic-response"), "xml={xml}");
+        assert!(xml.contains(r#"status="ok""#), "xml={xml}");
+        // No payload: the root is self-closing (attributes only, no children).
+        assert!(xml.contains("/>"), "expected self-closing root, xml={xml}");
+    }
+
+    #[test]
+    fn get_license_roundtrip_names() {
+        let resp = SubsonicResponse::ok_with(Payload::License(License {
+            valid: true,
+            email: None,
+            license_expires: None,
+            trial_expires: None,
+        }));
+        let xml = serialize_to_xml(&resp);
+        let v: Value = serde_json::from_str(&serialize_to_json(&resp)).unwrap();
+        assert!(v["subsonic-response"]["license"]["valid"] == true);
+        assert!(xml.contains("<license "), "xml={xml}");
+    }
+
+    #[test]
+    fn get_album_list_roundtrip_names() {
+        let resp = SubsonicResponse::ok_with(Payload::AlbumList(AlbumList {
+            album: vec![sample_album()],
+        }));
+        let xml = serialize_to_xml(&resp);
+        let v: Value = serde_json::from_str(&serialize_to_json(&resp)).unwrap();
+        assert_eq!(v["subsonic-response"]["albumList"]["album"][0]["id"], "al-1");
+        assert!(xml.contains("<albumList>"), "xml={xml}");
+        assert!(xml.contains(r#"<album id="al-1""#), "xml={xml}");
+    }
+
+    #[test]
+    fn get_album_roundtrip_names() {
+        let resp = SubsonicResponse::ok_with(Payload::Album(AlbumWithSongs {
+            id: "al-9".into(),
+            name: "A".into(),
+            artist: None,
+            artist_id: None,
+            cover_art: None,
+            song_count: Some(0),
+            duration: None,
+            year: None,
+            genre: None,
+            song: vec![],
+        }));
+        let xml = serialize_to_xml(&resp);
+        let v: Value = serde_json::from_str(&serialize_to_json(&resp)).unwrap();
+        assert_eq!(v["subsonic-response"]["album"]["id"], "al-9");
+        assert!(xml.contains(r#"<album id="al-9""#), "xml={xml}");
+    }
+
+    #[test]
+    fn search3_roundtrip_names() {
+        let resp = SubsonicResponse::ok_with(Payload::SearchResult3(SearchResult3 {
+            artist: Some(vec![]),
+            album: Some(vec![sample_album()]),
+            song: Some(vec![]),
+        }));
+        let xml = serialize_to_xml(&resp);
+        let v: Value = serde_json::from_str(&serialize_to_json(&resp)).unwrap();
+        assert_eq!(
+            v["subsonic-response"]["searchResult3"]["album"][0]["id"],
+            "al-1"
+        );
+        assert!(xml.contains("<searchResult3>"), "xml={xml}");
+    }
+
+    #[test]
+    fn open_subsonic_extensions_roundtrip_names() {
+        let resp = SubsonicResponse::ok_with(Payload::OpenSubsonicExtensions(vec![]));
+        let xml = serialize_to_xml(&resp);
+        let v: Value = serde_json::from_str(&serialize_to_json(&resp)).unwrap();
+        assert!(v["subsonic-response"]
+            .as_object()
+            .unwrap()
+            .contains_key("openSubsonicExtensions"));
+        // Empty extension list has no child elements but the response is valid.
+        assert!(xml.contains("<subsonic-response"), "xml={xml}");
+    }
+
+    #[test]
+    fn get_music_directory_roundtrip_names() {
+        let resp = SubsonicResponse::ok_with(Payload::Directory(Directory {
+            id: "ar-5".into(),
+            name: "Artist".into(),
+            parent: None,
+            play_count: None,
+            child: vec![],
+        }));
+        let xml = serialize_to_xml(&resp);
+        let v: Value = serde_json::from_str(&serialize_to_json(&resp)).unwrap();
+        assert_eq!(v["subsonic-response"]["directory"]["id"], "ar-5");
+        assert!(xml.contains(r#"<directory id="ar-5""#), "xml={xml}");
+    }
+
+    #[test]
+    fn get_starred_emits_both_starred_and_starred2() {
+        let resp = SubsonicResponse::ok_with(Payload::Starred(
+            Starred {
+                artist: None,
+                album: Some(vec![sample_album()]),
+                song: None,
+            },
+            Starred2 {
+                artist: None,
+                album: Some(vec![sample_album()]),
+                song: None,
+            },
+        ));
+        let xml = serialize_to_xml(&resp);
+        let v: Value = serde_json::from_str(&serialize_to_json(&resp)).unwrap();
+        let obj = v["subsonic-response"].as_object().unwrap();
+        assert!(obj.contains_key("starred"), "json={v}");
+        assert!(obj.contains_key("starred2"), "json={v}");
+        assert!(xml.contains("<starred>"), "xml={xml}");
+        assert!(xml.contains("<starred2>"), "xml={xml}");
     }
 }

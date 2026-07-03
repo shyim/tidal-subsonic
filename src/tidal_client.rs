@@ -1,4 +1,4 @@
-use crate::db::DbConfig;
+use crate::db::{self, DbConfig, SharedDb};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -292,26 +292,37 @@ pub struct DeviceAuthResponse {
     pub expires_in: u64,
 }
 
-pub type SharedTidalClient = Arc<Mutex<TidalClient>>;
+/// The mutable credential state of a `TidalClient`. Kept behind a small mutex
+/// inside the client so the reqwest client and outer handle can be shared
+/// without holding a lock across upstream HTTP round-trips: methods lock this
+/// only briefly to read the current token / refresh it, never across `.await`
+/// of an upstream request.
+#[derive(Debug, Clone)]
+struct Creds {
+    access_token: String,
+    refresh_token: String,
+    user_id: Option<u64>,
+    country_code: String,
+}
+
+pub type SharedTidalClient = Arc<TidalClient>;
 
 pub struct TidalClient {
     client: Client,
-    pub access_token: String,
-    pub refresh_token: String,
+    creds: Mutex<Creds>,
     client_id: String,
     client_secret: String,
-    user_id: Option<u64>,
-    pub country_code: String,
-    max_quality: String,
+    db: SharedDb,
 }
 
 impl TidalClient {
-    pub fn from_db_config(cfg: &DbConfig) -> Self {
-        let access_token = cfg.tidal_access_token.clone();
-        let refresh_token = cfg.tidal_refresh_token.clone();
-        let user_id = cfg.tidal_user_id;
-        let country_code = cfg.tidal_country_code.clone();
-        let max_quality = cfg.tidal_max_quality.clone();
+    pub fn from_db_config(cfg: &DbConfig, db: SharedDb) -> Self {
+        let creds = Creds {
+            access_token: cfg.tidal_access_token.clone(),
+            refresh_token: cfg.tidal_refresh_token.clone(),
+            user_id: cfg.tidal_user_id,
+            country_code: cfg.tidal_country_code.clone(),
+        };
         let client_id = cfg.tidal_client_id.clone();
         let client_secret = cfg.tidal_client_secret.clone();
 
@@ -320,29 +331,56 @@ impl TidalClient {
                 .timeout(Duration::from_secs(30))
                 .build()
                 .unwrap(),
-            access_token,
-            refresh_token,
+            creds: Mutex::new(creds),
             client_id,
             client_secret,
-            user_id,
-            country_code,
-            max_quality,
+            db,
         }
     }
 
-    pub fn set_tokens(&mut self, access_token: String, refresh_token: String, user_id: Option<u64>, country_code: String) {
-        self.access_token = access_token;
-        self.refresh_token = refresh_token;
-        self.user_id = user_id;
-        self.country_code = country_code;
+    pub async fn set_tokens(&self, access_token: String, refresh_token: String, user_id: Option<u64>, country_code: String) {
+        let mut creds = self.creds.lock().await;
+        creds.access_token = access_token;
+        creds.refresh_token = refresh_token;
+        creds.user_id = user_id;
+        creds.country_code = country_code;
     }
 
-    pub fn is_authenticated(&self) -> bool {
-        !self.access_token.is_empty()
+    /// Persist the current credentials to the DB. Call whenever tokens change so
+    /// a rotated refresh token survives a restart.
+    async fn persist_creds(&self) {
+        let creds = self.creds.lock().await.clone();
+        if let Err(e) = db::save_tokens(
+            &self.db,
+            &creds.access_token,
+            &creds.refresh_token,
+            creds.user_id,
+            &creds.country_code,
+        )
+        .await
+        {
+            tracing::warn!("Failed to persist TIDAL tokens: {}", e);
+        }
     }
 
-    pub fn user_id(&self) -> Option<u64> {
-        self.user_id
+    pub async fn is_authenticated(&self) -> bool {
+        !self.creds.lock().await.access_token.is_empty()
+    }
+
+    pub async fn user_id(&self) -> Option<u64> {
+        self.creds.lock().await.user_id
+    }
+
+    pub async fn access_token(&self) -> String {
+        self.creds.lock().await.access_token.clone()
+    }
+
+    pub async fn refresh_token(&self) -> String {
+        self.creds.lock().await.refresh_token.clone()
+    }
+
+    pub async fn country_code(&self) -> String {
+        self.creds.lock().await.country_code.clone()
     }
 
     // ------ Auth ------ 
@@ -430,17 +468,18 @@ impl TidalClient {
         let _tokens: TokenResp = serde_json::from_str(&body)
             .map_err(|e| format!("Parse error: {} - Body: {}", e, body))?;
 
-        // We can't save here because we don't have &mut self
+        // We can't save here because we don't have &self
         Ok(Some(()))
     }
 
     async fn refresh_token_request(&self) -> Result<(String, String), String> {
         let client_id = &self.client_id;
         let client_secret = &self.client_secret;
+        let current_refresh = self.creds.lock().await.refresh_token.clone();
 
         let mut form_params = vec![
             ("client_id", client_id.as_str()),
-            ("refresh_token", self.refresh_token.as_str()),
+            ("refresh_token", current_refresh.as_str()),
             ("grant_type", "refresh_token"),
             ("scope", "r_usr w_usr w_sub"),
         ];
@@ -476,27 +515,36 @@ impl TidalClient {
         let tokens: RefreshResp = serde_json::from_str(&body)
             .map_err(|e| format!("Parse error: {} - Body: {}", e, body))?;
 
-        Ok((tokens.access_token, tokens.refresh_token.unwrap_or_else(|| self.refresh_token.clone())))
+        Ok((tokens.access_token, tokens.refresh_token.unwrap_or(current_refresh)))
     }
 
-    async fn ensure_auth(&mut self) -> Result<(), String> {
-        if !self.access_token.is_empty() {
+    async fn ensure_auth(&self) -> Result<(), String> {
+        let (has_access, has_refresh) = {
+            let creds = self.creds.lock().await;
+            (!creds.access_token.is_empty(), !creds.refresh_token.is_empty())
+        };
+        if has_access {
             return Ok(());
         }
-        if !self.refresh_token.is_empty() {
+        if has_refresh {
             let (access, refresh) = self.refresh_token_request().await?;
-            self.access_token = access;
-            self.refresh_token = refresh;
+            {
+                let mut creds = self.creds.lock().await;
+                creds.access_token = access;
+                creds.refresh_token = refresh;
+            }
+            // TIDAL rotates the refresh token; persist so it survives a restart.
+            self.persist_creds().await;
             return Ok(());
         }
         Err("Not authenticated. Visit the web UI to log in with TIDAL.".into())
     }
 
-    async fn authenticated_get(&mut self, url: &str, query: &[(&str, &str)]) -> Result<String, String> {
+    async fn authenticated_get(&self, url: &str, query: &[(&str, &str)]) -> Result<String, String> {
         self.ensure_auth().await?;
 
         let client = self.client.clone();
-        let token = self.access_token.clone();
+        let token = self.access_token().await;
         let url = url.to_string();
         let query: Vec<(String, String)> = query.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
 
@@ -520,9 +568,14 @@ impl TidalClient {
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             // Refresh and retry
             let (access, refresh) = self.refresh_token_request().await?;
-            self.access_token = access;
-            self.refresh_token = refresh;
-            let response = make_request(self.access_token.clone()).await?;
+            {
+                let mut creds = self.creds.lock().await;
+                creds.access_token = access;
+                creds.refresh_token = refresh;
+            }
+            // TIDAL rotates the refresh token; persist so it survives a restart.
+            self.persist_creds().await;
+            let response = make_request(self.access_token().await).await?;
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             if !status.is_success() {
@@ -540,7 +593,7 @@ impl TidalClient {
     }
 
     async fn api_get<T: serde::de::DeserializeOwned>(
-        &mut self,
+        &self,
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<T, String> {
@@ -555,7 +608,7 @@ impl TidalClient {
 
     // ------ API Methods ------ 
 
-    pub async fn get_session_info(&mut self) -> Result<u64, String> {
+    pub async fn get_session_info(&self) -> Result<u64, String> {
         let body = self.authenticated_get(
             &format!("{}/sessions", TIDAL_API_URL),
             &[],
@@ -570,22 +623,27 @@ impl TidalClient {
 
         let data: SessionResponse =
             serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
-        if let Some(cc) = data.country_code {
-            if !cc.is_empty() {
-                self.country_code = cc;
+        {
+            let mut creds = self.creds.lock().await;
+            if let Some(cc) = data.country_code {
+                if !cc.is_empty() {
+                    creds.country_code = cc;
+                }
             }
+            creds.user_id = Some(data.user_id);
         }
-        self.user_id = Some(data.user_id);
+        // Persist the freshly discovered user_id / country_code.
+        self.persist_creds().await;
         Ok(data.user_id)
     }
 
     pub async fn get_user_playlists(
-        &mut self,
+        &self,
         user_id: u64,
         offset: u32,
         limit: u32,
     ) -> Result<PaginatedResponse<TidalPlaylist>, String> {
-        let cc = self.country_code.clone();
+        let cc = self.country_code().await;
         let body = self.authenticated_get(
             &format!("{}/users/{}/playlists", TIDAL_API_URL, user_id),
             &[
@@ -611,19 +669,19 @@ impl TidalClient {
         })
     }
 
-    pub async fn get_playlist(&mut self, playlist_id: &str) -> Result<TidalPlaylist, String> {
-        let cc = self.country_code.clone();
+    pub async fn get_playlist(&self, playlist_id: &str) -> Result<TidalPlaylist, String> {
+        let cc = self.country_code().await;
         self.api_get(&format!("/playlists/{}", playlist_id), &[("countryCode", &cc)])
             .await
     }
 
     pub async fn get_playlist_tracks(
-        &mut self,
+        &self,
         playlist_id: &str,
         offset: u32,
         limit: u32,
     ) -> Result<PaginatedTracks, String> {
-        let cc = self.country_code.clone();
+        let cc = self.country_code().await;
         let body = self.authenticated_get(
             &format!("{}/playlists/{}/tracks", TIDAL_API_URL, playlist_id),
             &[
@@ -654,12 +712,12 @@ impl TidalClient {
     }
 
     pub async fn get_favorite_tracks(
-        &mut self,
+        &self,
         user_id: u64,
         offset: u32,
         limit: u32,
     ) -> Result<PaginatedTracks, String> {
-        let cc = self.country_code.clone();
+        let cc = self.country_code().await;
         let body = self.authenticated_get(
             &format!("{}/users/{}/favorites/tracks", TIDAL_API_URL, user_id),
             &[
@@ -696,12 +754,12 @@ impl TidalClient {
     }
 
     pub async fn get_favorite_albums(
-        &mut self,
+        &self,
         user_id: u64,
         offset: u32,
         limit: u32,
     ) -> Result<PaginatedResponse<TidalAlbumDetail>, String> {
-        let cc = self.country_code.clone();
+        let cc = self.country_code().await;
         let body = self.authenticated_get(
             &format!("{}/users/{}/favorites/albums", TIDAL_API_URL, user_id),
             &[
@@ -734,12 +792,12 @@ impl TidalClient {
     }
 
     pub async fn get_favorite_artists(
-        &mut self,
+        &self,
         user_id: u64,
         offset: u32,
         limit: u32,
     ) -> Result<PaginatedResponse<TidalArtistDetail>, String> {
-        let cc = self.country_code.clone();
+        let cc = self.country_code().await;
         let body = self.authenticated_get(
             &format!("{}/users/{}/favorites/artists", TIDAL_API_URL, user_id),
             &[
@@ -774,17 +832,20 @@ impl TidalClient {
     /// Add an item to the user's TIDAL favorites. `kind` is the favorites
     /// collection ("tracks" | "albums" | "artists") and `id_param` the matching
     /// id field ("trackIds" | "albumIds" | "artistIds").
-    async fn add_favorite(&mut self, kind: &str, id_param: &str, id: u64) -> Result<(), String> {
+    async fn add_favorite(&self, kind: &str, id_param: &str, id: u64) -> Result<(), String> {
         self.ensure_auth().await?;
-        let user_id = self.user_id.ok_or("Not authenticated with TIDAL")?;
-        let cc = self.country_code.clone();
+        let (user_id, cc, token) = {
+            let creds = self.creds.lock().await;
+            (creds.user_id, creds.country_code.clone(), creds.access_token.clone())
+        };
+        let user_id = user_id.ok_or("Not authenticated with TIDAL")?;
         let url = format!("{}/users/{}/favorites/{}", TIDAL_API_URL, user_id, kind);
         let id_str = id.to_string();
 
         let resp = self
             .client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.access_token))
+            .header("Authorization", format!("Bearer {}", token))
             .query(&[("countryCode", cc.as_str())])
             .form(&[(id_param, id_str.as_str()), ("onArtifactNotFound", "FAIL")])
             .send()
@@ -800,16 +861,19 @@ impl TidalClient {
     }
 
     /// Remove an item from the user's TIDAL favorites.
-    async fn remove_favorite(&mut self, kind: &str, id: u64) -> Result<(), String> {
+    async fn remove_favorite(&self, kind: &str, id: u64) -> Result<(), String> {
         self.ensure_auth().await?;
-        let user_id = self.user_id.ok_or("Not authenticated with TIDAL")?;
-        let cc = self.country_code.clone();
+        let (user_id, cc, token) = {
+            let creds = self.creds.lock().await;
+            (creds.user_id, creds.country_code.clone(), creds.access_token.clone())
+        };
+        let user_id = user_id.ok_or("Not authenticated with TIDAL")?;
         let url = format!("{}/users/{}/favorites/{}/{}", TIDAL_API_URL, user_id, kind, id);
 
         let resp = self
             .client
             .delete(&url)
-            .header("Authorization", format!("Bearer {}", self.access_token))
+            .header("Authorization", format!("Bearer {}", token))
             .query(&[("countryCode", cc.as_str())])
             .send()
             .await
@@ -823,37 +887,37 @@ impl TidalClient {
         Ok(())
     }
 
-    pub async fn add_favorite_track(&mut self, id: u64) -> Result<(), String> {
+    pub async fn add_favorite_track(&self, id: u64) -> Result<(), String> {
         self.add_favorite("tracks", "trackIds", id).await
     }
-    pub async fn add_favorite_album(&mut self, id: u64) -> Result<(), String> {
+    pub async fn add_favorite_album(&self, id: u64) -> Result<(), String> {
         self.add_favorite("albums", "albumIds", id).await
     }
-    pub async fn add_favorite_artist(&mut self, id: u64) -> Result<(), String> {
+    pub async fn add_favorite_artist(&self, id: u64) -> Result<(), String> {
         self.add_favorite("artists", "artistIds", id).await
     }
-    pub async fn remove_favorite_track(&mut self, id: u64) -> Result<(), String> {
+    pub async fn remove_favorite_track(&self, id: u64) -> Result<(), String> {
         self.remove_favorite("tracks", id).await
     }
-    pub async fn remove_favorite_album(&mut self, id: u64) -> Result<(), String> {
+    pub async fn remove_favorite_album(&self, id: u64) -> Result<(), String> {
         self.remove_favorite("albums", id).await
     }
-    pub async fn remove_favorite_artist(&mut self, id: u64) -> Result<(), String> {
+    pub async fn remove_favorite_artist(&self, id: u64) -> Result<(), String> {
         self.remove_favorite("artists", id).await
     }
 
-    pub async fn get_album_detail(&mut self, album_id: u64) -> Result<TidalAlbumDetail, String> {
-        let cc = self.country_code.clone();
+    pub async fn get_album_detail(&self, album_id: u64) -> Result<TidalAlbumDetail, String> {
+        let cc = self.country_code().await;
         self.api_get(&format!("/albums/{}", album_id), &[("countryCode", &cc)]).await
     }
 
     pub async fn get_album_tracks(
-        &mut self,
+        &self,
         album_id: u64,
         offset: u32,
         limit: u32,
     ) -> Result<PaginatedTracks, String> {
-        let cc = self.country_code.clone();
+        let cc = self.country_code().await;
         let body = self.authenticated_get(
             &format!("{}/albums/{}/tracks", TIDAL_API_URL, album_id),
             &[
@@ -884,20 +948,20 @@ impl TidalClient {
     }
 
     pub async fn get_artist_detail(
-        &mut self,
+        &self,
         artist_id: u64,
     ) -> Result<TidalArtistDetail, String> {
-        let cc = self.country_code.clone();
+        let cc = self.country_code().await;
         self.api_get(&format!("/artists/{}", artist_id), &[("countryCode", &cc)]).await
     }
 
     pub async fn get_artist_albums(
-        &mut self,
+        &self,
         artist_id: u64,
         offset: u32,
         limit: u32,
     ) -> Result<PaginatedResponse<TidalAlbumDetail>, String> {
-        let cc = self.country_code.clone();
+        let cc = self.country_code().await;
         let body = self.authenticated_get(
             &format!("{}/artists/{}/albums", TIDAL_API_URL, artist_id),
             &[
@@ -924,12 +988,12 @@ impl TidalClient {
     }
 
     pub async fn get_artist_top_tracks(
-        &mut self,
+        &self,
         artist_id: u64,
         offset: u32,
         limit: u32,
     ) -> Result<PaginatedTracks, String> {
-        let cc = self.country_code.clone();
+        let cc = self.country_code().await;
         let body = self.authenticated_get(
             &format!("{}/artists/{}/tracks", TIDAL_API_URL, artist_id),
             &[
@@ -956,11 +1020,11 @@ impl TidalClient {
     }
 
     pub async fn search(
-        &mut self,
+        &self,
         query: &str,
         limit: u32,
     ) -> Result<TidalSearchResults, String> {
-        let cc = self.country_code.clone();
+        let cc = self.country_code().await;
         let body = self.authenticated_get(
             &format!("{}/search", TIDAL_API_V2_URL),
             &[
@@ -1004,17 +1068,17 @@ impl TidalClient {
         })
     }
 
-    pub async fn get_track(&mut self, track_id: u64) -> Result<TidalTrack, String> {
-        let cc = self.country_code.clone();
+    pub async fn get_track(&self, track_id: u64) -> Result<TidalTrack, String> {
+        let cc = self.country_code().await;
         self.api_get(&format!("/tracks/{}", track_id), &[("countryCode", &cc)]).await
     }
 
     pub async fn get_stream_url(
-        &mut self,
+        &self,
         track_id: u64,
         quality: &str,
     ) -> Result<StreamInfo, String> {
-        let cc = self.country_code.clone();
+        let cc = self.country_code().await;
         let body = self.authenticated_get(
             &format!("{}/tracks/{}/playbackinfopostpaywall", TIDAL_API_URL, track_id),
             &[
@@ -1142,7 +1206,7 @@ impl TidalClient {
     /// HI-RES tracks — which come back as segmented DASH — still play through
     /// the proxy at the best format that can be served as one file.
     pub async fn get_streamable_url(
-        &mut self,
+        &self,
         track_id: u64,
         max_quality: &str,
     ) -> Result<StreamInfo, String> {
@@ -1171,8 +1235,8 @@ impl TidalClient {
         Err(last_err)
     }
 
-    pub async fn get_track_lyrics(&mut self, track_id: u64) -> Result<TidalLyrics, String> {
-        let cc = self.country_code.clone();
+    pub async fn get_track_lyrics(&self, track_id: u64) -> Result<TidalLyrics, String> {
+        let cc = self.country_code().await;
         self.api_get(&format!("/tracks/{}/lyrics", track_id), &[("countryCode", &cc)]).await
     }
 }

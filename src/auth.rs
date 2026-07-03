@@ -1,9 +1,9 @@
 use crate::db::{self};
 use axum::{
-    extract::{Query, State},
+    extract::{Form, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use base64::Engine;
@@ -34,7 +34,9 @@ struct SetupQuery {
 pub fn auth_routes() -> Router<crate::AppState> {
     Router::new()
         .route("/", get(handle_setup_page))
-        .route("/authorize", get(handle_authorize))
+        // POST so the Subsonic password is sent in the request body, not the
+        // URL query string (which would be logged / kept in history).
+        .route("/authorize", post(handle_authorize))
         .route("/callback", get(handle_callback))
 }
 
@@ -47,6 +49,9 @@ async fn handle_setup_page(
 
     // Check if already authenticated
     if !config.tidal_access_token.is_empty() && config.tidal_user_id.is_some() {
+        // Interpolated values are user-controlled (set via the setup form) and
+        // persisted, so they must be HTML-escaped to avoid stored XSS. The
+        // password is a secret — never echo it back into the page.
         let html = format!(
             r#"<!DOCTYPE html>
 <html lang="en">
@@ -72,16 +77,15 @@ a {{ color:#00d4aa; }}
 <p>
   <b>URL:</b> <code>http://{host}:{port}</code><br>
   <b>Username:</b> <code>{username}</code><br>
-  <b>Password:</b> <code>{password}</code>
+  <b>Password:</b> <span class="info">(the password you set during setup)</span>
 </p>
 </div>
 </body>
 </html>"#,
             user_id = config.tidal_user_id.unwrap_or(0),
-            host = config.server_host,
+            host = html_escape(&config.server_host),
             port = config.server_port,
-            username = config.subsonic_username,
-            password = config.subsonic_password,
+            username = html_escape(&config.subsonic_username),
         );
         return (StatusCode::OK, [("content-type", "text/html")], html).into_response();
     }
@@ -94,8 +98,28 @@ a {{ color:#00d4aa; }}
 #[axum::debug_handler]
 async fn handle_authorize(
     State(state): State<crate::AppState>,
-    Query(params): Query<SetupQuery>,
+    // Credentials arrive in the POST body (axum::Form), keeping the Subsonic
+    // password out of the URL/query string. Form must be the last extractor.
+    Form(params): Form<SetupQuery>,
 ) -> Response {
+    // Once TIDAL is set up, refuse to re-run the setup flow. Otherwise an
+    // unauthenticated caller who can reach this endpoint could overwrite the
+    // stored Subsonic username/password (a credential-reset bypass).
+    {
+        let cfg = db::load_config(&state.db).await;
+        if !cfg.tidal_access_token.is_empty() && cfg.tidal_user_id.is_some() {
+            return (
+                StatusCode::FORBIDDEN,
+                [("content-type", "text/html")],
+                r#"<!DOCTYPE html><html><body style="font-family:sans-serif;max-width:600px;margin:60px auto;background:#0a0a0a;color:#eee">
+<h1 style="color:#00d4aa">Already set up</h1>
+<p>This server is already connected to TIDAL. To change credentials, stop the server and reset its database.</p>
+</body></html>"#,
+            )
+                .into_response();
+        }
+    }
+
     // Use hard-coded client_id, ignore user input
     let client_id = DEFAULT_CLIENT_ID.to_string();
     let client_secret = String::new();
@@ -286,11 +310,8 @@ async fn handle_callback(
             db::save_tokens(&state.db, &access_token, &refresh_token, Some(user_id), &cc).await.ok();
 
             // Push tokens into the running TidalClient immediately
-            {
-                let mut tidal = state.tidal.lock().await;
-                tidal.set_tokens(access_token.clone(), refresh_token.clone(), Some(user_id), cc.clone());
-                tracing::info!("TIDAL authenticated as user {}", user_id);
-            }
+            state.tidal.set_tokens(access_token.clone(), refresh_token.clone(), Some(user_id), cc.clone()).await;
+            tracing::info!("TIDAL authenticated as user {}", user_id);
 
             // Clear PKCE session
             {
@@ -410,4 +431,20 @@ async fn get_country_code(client: &reqwest::Client, access_token: &str) -> Resul
 fn urlencoding(s: &str) -> String {
     // Simple URL encoding (just for redirect_uri)
     s.replace(":", "%3A").replace("/", "%2F")
+}
+
+/// Escape a string for safe interpolation into HTML text/attribute context.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
