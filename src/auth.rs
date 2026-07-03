@@ -31,7 +31,7 @@ struct SetupQuery {
     subsonic_password: Option<String>,
 }
 
-pub fn auth_routes() -> Router<crate::AppState> {
+pub fn auth_routes() -> Router<crate::app::AppState> {
     Router::new()
         .route("/", get(handle_setup_page))
         // POST so the Subsonic password is sent in the request body, not the
@@ -41,7 +41,7 @@ pub fn auth_routes() -> Router<crate::AppState> {
 }
 
 async fn handle_setup_page(
-    State(state): State<crate::AppState>,
+    State(state): State<crate::app::AppState>,
     Query(_params): Query<SetupQuery>,
 ) -> Response {
     let db = &state.db;
@@ -97,7 +97,7 @@ a {{ color:#00d4aa; }}
 
 #[axum::debug_handler]
 async fn handle_authorize(
-    State(state): State<crate::AppState>,
+    State(state): State<crate::app::AppState>,
     // Credentials arrive in the POST body (axum::Form), keeping the Subsonic
     // password out of the URL/query string. Form must be the last extractor.
     Form(params): Form<SetupQuery>,
@@ -246,7 +246,7 @@ struct CallbackQuery {
 
 #[axum::debug_handler]
 async fn handle_callback(
-    State(state): State<crate::AppState>,
+    State(state): State<crate::app::AppState>,
     Query(params): Query<CallbackQuery>,
 ) -> Response {
     let code = params.code.trim().to_string();
