@@ -116,6 +116,7 @@ async fn main() {
         ("deletePlaylist", get(playlists::handle_delete_playlist)),
         ("getCoverArt", get(media::handle_get_cover_art)),
         ("stream", get(media::handle_stream)),
+        ("download", get(media::handle_download)),
         ("scrobble", get(system::handle_scrobble)),
         ("getUser", get(system::handle_get_user)),
         ("getScanStatus", get(system::handle_get_scan_status)),

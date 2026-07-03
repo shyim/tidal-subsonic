@@ -43,3 +43,8 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Error handling
 anyhow = "1"
+
+# Audio transcoding (AAC-LC in fMP4 -> MP3) for clients that require MP3,
+# e.g. the Garmin YuMusic app which declares Media.ENCODING_MP3.
+symphonia = { version = "0.5", default-features = false, features = ["aac", "isomp4"] }
+mp3lame-encoder = "0.2"

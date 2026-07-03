@@ -1,6 +1,7 @@
 use crate::auth_mw::{render_current, xml_error, Authed};
 use crate::item_id::ItemId;
 use crate::mapping;
+use crate::routes::transcode;
 use crate::tidal::StreamInfo;
 use axum::{
     http::{header, StatusCode},
@@ -65,6 +66,14 @@ pub(crate) async fn handle_get_cover_art(authed: Authed) -> Response {
 
 // ------ Streaming ------
 
+/// `download` fetches a track as a file (used by clients like the YuMusic
+/// Garmin app for offline sync). For this proxy it's identical to `stream`: we
+/// don't transcode, and TIDAL only ever delivers fragmented MP4, so the
+/// downloaded bytes are the same seekable file `stream` produces.
+pub(crate) async fn handle_download(authed: Authed, headers: HeaderMap) -> Response {
+    handle_stream(authed, headers).await
+}
+
 pub(crate) async fn handle_stream(authed: Authed, headers: HeaderMap) -> Response {
     let state = &authed.state;
     let params = &authed.params;
@@ -98,8 +107,16 @@ pub(crate) async fn handle_stream(authed: Authed, headers: HeaderMap) -> Respons
         requested_format.as_deref(),
         Some(fmt) if fmt != "raw" && !fmt.is_empty()
     );
+    // Clients that require actual MP3 (e.g. the Garmin YuMusic app, which
+    // declares Media.ENCODING_MP3) get a real MP3 transcode rather than the
+    // AAC-in-MP4 the proxy normally serves.
+    let wants_mp3 = requested_format.as_deref() == Some("mp3");
 
-    let ceiling = if wants_transcode {
+    let ceiling = if wants_mp3 {
+        // MP3 transcode decodes with symphonia, which handles AAC-LC (HIGH,
+        // mp4a.40.2) but NOT HE-AAC (LOW, mp4a.40.5) — always source HIGH.
+        "HIGH"
+    } else if wants_transcode {
         // Client can't take the raw codec: give it AAC, bitrate-capped.
         if max_bit_rate != 0 && max_bit_rate < 128 {
             "LOW"
@@ -140,6 +157,35 @@ pub(crate) async fn handle_stream(authed: Authed, headers: HeaderMap) -> Respons
     if !all_ok {
         tracing::warn!("Blocked unsafe stream host for track {}", track_id);
         return render_current(&xml_error(0, "Refusing to proxy an unsafe stream URL"));
+    }
+
+    // MP3 transcode path: fetch the whole (AAC-LC-in-fMP4) track, decode+encode
+    // to MP3, and serve it as audio/mpeg with a Content-Length. Used by clients
+    // that require real MP3 bytes.
+    if wants_mp3 {
+        let raw = match fetch_full_track(&state.http_client, &stream_info).await {
+            Ok(b) => b,
+            Err(e) => return render_current(&xml_error(0, &format!("MP3 source fetch: {}", e))),
+        };
+
+        let bitrate = if max_bit_rate == 0 { 320 } else { max_bit_rate };
+        match transcode::aac_mp4_to_mp3(raw, bitrate).await {
+            Ok(mp3) => {
+                let mut out_headers = axum::http::HeaderMap::new();
+                out_headers.insert(header::CONTENT_TYPE, "audio/mpeg".parse().unwrap());
+                out_headers.insert(
+                    header::CONTENT_LENGTH,
+                    mp3.len().to_string().parse().unwrap(),
+                );
+                out_headers.insert(header::ACCEPT_RANGES, "none".parse().unwrap());
+                out_headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
+                return (StatusCode::OK, out_headers, mp3).into_response();
+            }
+            Err(e) => {
+                tracing::warn!("MP3 transcode failed for track {}: {}", track_id, e);
+                return render_current(&xml_error(0, &format!("MP3 transcode failed: {}", e)));
+            }
+        }
     }
 
     // Segmented DASH: concatenate the ordered segments into one playable file.
@@ -214,40 +260,54 @@ async fn stream_segments(
     // the audio codec inside (AAC or FLAC-in-MP4), so advertise the container.
     let content_type = "audio/mp4";
 
-    // Fetch all segments in order and concatenate. These files are single
-    // tracks (~9-40 MB), so buffering to get a seekable, length-known response
-    // is worth it.
-    let mut buf: Vec<u8> = Vec::new();
-    for (idx, seg_url) in info.segments.iter().enumerate() {
-        match client.get(seg_url).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-                Ok(bytes) => buf.extend_from_slice(&bytes),
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        format!("segment {} body error: {}", idx, e),
-                    )
-                        .into_response();
-                }
-            },
-            Ok(resp) => {
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    format!("segment {} HTTP {}", idx, resp.status()),
-                )
-                    .into_response();
-            }
-            Err(e) => {
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    format!("segment {} fetch error: {}", idx, e),
-                )
-                    .into_response();
-            }
-        }
-    }
+    let buf = match fetch_all_segments(client, &info.segments).await {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_GATEWAY, e).into_response(),
+    };
 
     serve_bytes_with_range(buf, content_type, range.as_deref())
+}
+
+/// Fetch a whole track into memory, whether it comes as DASH segments or a
+/// single URL. Used by the MP3 transcode path (which needs the full buffer).
+async fn fetch_full_track(client: &ReqwestClient, info: &StreamInfo) -> Result<Vec<u8>, String> {
+    if !info.segments.is_empty() {
+        return fetch_all_segments(client, &info.segments).await;
+    }
+    let resp = client
+        .get(&info.url)
+        .send()
+        .await
+        .map_err(|e| format!("stream fetch error: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("upstream HTTP {}", resp.status()));
+    }
+    resp.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("stream body error: {}", e))
+}
+
+/// Fetch every DASH segment in order and concatenate into one fMP4 buffer.
+/// Single tracks are ~9-40 MB, so buffering is acceptable.
+async fn fetch_all_segments(client: &ReqwestClient, segments: &[String]) -> Result<Vec<u8>, String> {
+    let mut buf: Vec<u8> = Vec::new();
+    for (idx, seg_url) in segments.iter().enumerate() {
+        let resp = client
+            .get(seg_url)
+            .send()
+            .await
+            .map_err(|e| format!("segment {} fetch error: {}", idx, e))?;
+        if !resp.status().is_success() {
+            return Err(format!("segment {} HTTP {}", idx, resp.status()));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("segment {} body error: {}", idx, e))?;
+        buf.extend_from_slice(&bytes);
+    }
+    Ok(buf)
 }
 
 /// Serve an in-memory body with `Accept-Ranges` and single-range `206` support.
