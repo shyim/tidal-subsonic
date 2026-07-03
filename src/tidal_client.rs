@@ -1,10 +1,20 @@
-use crate::config::Config;
+use crate::db::DbConfig;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+
+/// Sentinel error returned by `get_stream_url` when a track resolves to a
+/// segmented DASH manifest that has no single downloadable URL.
+const DASH_SEGMENTED_ERR: &str = "__dash_segmented__";
+
+/// Tidal audio qualities from highest to lowest. Used as a fallback ladder:
+/// HI_RES_LOSSLESS / LOSSLESS often return segmented DASH streams that a
+/// single-file Subsonic proxy can't serve, so we step down to a quality that
+/// returns a directly downloadable (BTS or single-BaseURL) stream.
+const QUALITY_LADDER: &[&str] = &["HI_RES_LOSSLESS", "LOSSLESS", "HIGH", "LOW"];
 
 const TIDAL_AUTH_URL: &str = "https://auth.tidal.com/v1/oauth2";
 const TIDAL_API_URL: &str = "https://api.tidal.com/v1";
@@ -229,6 +239,11 @@ pub struct TidalSearchResults {
 #[serde(rename_all = "camelCase")]
 pub struct StreamInfo {
     pub url: String,
+    /// For segmented DASH streams: the ordered list of segment URLs (init
+    /// segment first) that must be concatenated to reconstruct a playable file.
+    /// Empty when `url` is a single directly-downloadable file.
+    #[serde(default)]
+    pub segments: Vec<String>,
     #[serde(default)]
     pub codec: Option<String>,
     #[serde(default)]
@@ -281,31 +296,45 @@ pub type SharedTidalClient = Arc<Mutex<TidalClient>>;
 
 pub struct TidalClient {
     client: Client,
-    config: Config,
     pub access_token: String,
     pub refresh_token: String,
+    client_id: String,
+    client_secret: String,
     user_id: Option<u64>,
-    country_code: String,
+    pub country_code: String,
+    max_quality: String,
 }
 
 impl TidalClient {
-    pub fn new(config: Config) -> Self {
-        let access_token = config.tidal.access_token.clone().unwrap_or_default();
-        let refresh_token = config.tidal.refresh_token.clone().unwrap_or_default();
-        let user_id = config.tidal.user_id;
-        let country_code = config.tidal.country_code.clone();
+    pub fn from_db_config(cfg: &DbConfig) -> Self {
+        let access_token = cfg.tidal_access_token.clone();
+        let refresh_token = cfg.tidal_refresh_token.clone();
+        let user_id = cfg.tidal_user_id;
+        let country_code = cfg.tidal_country_code.clone();
+        let max_quality = cfg.tidal_max_quality.clone();
+        let client_id = cfg.tidal_client_id.clone();
+        let client_secret = cfg.tidal_client_secret.clone();
 
         Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .unwrap(),
-            config,
             access_token,
             refresh_token,
+            client_id,
+            client_secret,
             user_id,
             country_code,
+            max_quality,
         }
+    }
+
+    pub fn set_tokens(&mut self, access_token: String, refresh_token: String, user_id: Option<u64>, country_code: String) {
+        self.access_token = access_token;
+        self.refresh_token = refresh_token;
+        self.user_id = user_id;
+        self.country_code = country_code;
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -319,7 +348,7 @@ impl TidalClient {
     // ------ Auth ------ 
 
     pub async fn start_device_auth(&self) -> Result<DeviceAuthResponse, String> {
-        let client_id = &self.config.tidal.client_id;
+        let client_id = &self.client_id;
         if client_id.is_empty() {
             return Err("Client ID not configured. Set it in config.toml".into());
         }
@@ -362,7 +391,7 @@ impl TidalClient {
     }
 
     pub async fn poll_device_token(&self, device_code: &str) -> Result<Option<()>, String> {
-        let client_id = &self.config.tidal.client_id;
+        let client_id = &self.client_id;
 
         let response = self
             .client
@@ -406,8 +435,8 @@ impl TidalClient {
     }
 
     async fn refresh_token_request(&self) -> Result<(String, String), String> {
-        let client_id = &self.config.tidal.client_id;
-        let client_secret = self.config.tidal.client_secret.as_deref().unwrap_or("");
+        let client_id = &self.client_id;
+        let client_secret = &self.client_secret;
 
         let mut form_params = vec![
             ("client_id", client_id.as_str()),
@@ -458,14 +487,9 @@ impl TidalClient {
             let (access, refresh) = self.refresh_token_request().await?;
             self.access_token = access;
             self.refresh_token = refresh;
-            // Persist
-            let mut cfg = self.config.clone();
-            cfg.tidal.access_token = Some(self.access_token.clone());
-            cfg.tidal.refresh_token = Some(self.refresh_token.clone());
-            cfg.save().map_err(|e| format!("Save error: {}", e))?;
             return Ok(());
         }
-        Err("Not authenticated. Run 'tidal-subsonic login' to authenticate.".into())
+        Err("Not authenticated. Visit the web UI to log in with TIDAL.".into())
     }
 
     async fn authenticated_get(&mut self, url: &str, query: &[(&str, &str)]) -> Result<String, String> {
@@ -585,6 +609,12 @@ impl TidalClient {
             offset,
             limit,
         })
+    }
+
+    pub async fn get_playlist(&mut self, playlist_id: &str) -> Result<TidalPlaylist, String> {
+        let cc = self.country_code.clone();
+        self.api_get(&format!("/playlists/{}", playlist_id), &[("countryCode", &cc)])
+            .await
     }
 
     pub async fn get_playlist_tracks(
@@ -739,6 +769,77 @@ impl TidalClient {
             offset,
             limit,
         })
+    }
+
+    /// Add an item to the user's TIDAL favorites. `kind` is the favorites
+    /// collection ("tracks" | "albums" | "artists") and `id_param` the matching
+    /// id field ("trackIds" | "albumIds" | "artistIds").
+    async fn add_favorite(&mut self, kind: &str, id_param: &str, id: u64) -> Result<(), String> {
+        self.ensure_auth().await?;
+        let user_id = self.user_id.ok_or("Not authenticated with TIDAL")?;
+        let cc = self.country_code.clone();
+        let url = format!("{}/users/{}/favorites/{}", TIDAL_API_URL, user_id, kind);
+        let id_str = id.to_string();
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.access_token))
+            .query(&[("countryCode", cc.as_str())])
+            .form(&[(id_param, id_str.as_str()), ("onArtifactNotFound", "FAIL")])
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {}", e))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Favorite add error ({}): {}", status, body));
+        }
+        Ok(())
+    }
+
+    /// Remove an item from the user's TIDAL favorites.
+    async fn remove_favorite(&mut self, kind: &str, id: u64) -> Result<(), String> {
+        self.ensure_auth().await?;
+        let user_id = self.user_id.ok_or("Not authenticated with TIDAL")?;
+        let cc = self.country_code.clone();
+        let url = format!("{}/users/{}/favorites/{}/{}", TIDAL_API_URL, user_id, kind, id);
+
+        let resp = self
+            .client
+            .delete(&url)
+            .header("Authorization", format!("Bearer {}", self.access_token))
+            .query(&[("countryCode", cc.as_str())])
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {}", e))?;
+
+        let status = resp.status();
+        if !status.is_success() && status != reqwest::StatusCode::NOT_FOUND {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Favorite remove error ({}): {}", status, body));
+        }
+        Ok(())
+    }
+
+    pub async fn add_favorite_track(&mut self, id: u64) -> Result<(), String> {
+        self.add_favorite("tracks", "trackIds", id).await
+    }
+    pub async fn add_favorite_album(&mut self, id: u64) -> Result<(), String> {
+        self.add_favorite("albums", "albumIds", id).await
+    }
+    pub async fn add_favorite_artist(&mut self, id: u64) -> Result<(), String> {
+        self.add_favorite("artists", "artistIds", id).await
+    }
+    pub async fn remove_favorite_track(&mut self, id: u64) -> Result<(), String> {
+        self.remove_favorite("tracks", id).await
+    }
+    pub async fn remove_favorite_album(&mut self, id: u64) -> Result<(), String> {
+        self.remove_favorite("albums", id).await
+    }
+    pub async fn remove_favorite_artist(&mut self, id: u64) -> Result<(), String> {
+        self.remove_favorite("artists", id).await
     }
 
     pub async fn get_album_detail(&mut self, album_id: u64) -> Result<TidalAlbumDetail, String> {
@@ -986,10 +1087,30 @@ impl TidalClient {
                     });
                 }
             }
-            // Try to extract direct URL from DASH manifest
+            // First try a single direct BaseURL (some DASH manifests have one).
             url = extract_dash_direct_url(&manifest_str).unwrap_or_default();
             if url.is_empty() {
-                return Err("DASH manifests not supported for streaming proxy. Only BTS streams are currently supported.".into());
+                // Otherwise reconstruct the segment list from the
+                // SegmentTemplate so the caller can concatenate segments into a
+                // single playable file.
+                let segments = extract_dash_segments(&manifest_str);
+                if segments.is_empty() {
+                    return Err(DASH_SEGMENTED_ERR.to_string());
+                }
+                return Ok(StreamInfo {
+                    url: String::new(),
+                    segments,
+                    codec,
+                    bit_depth: data.bit_depth,
+                    sample_rate: data.sample_rate,
+                    audio_quality: data.audio_quality.clone(),
+                    manifest: Some(manifest_str),
+                    manifest_mime_type: Some(data.manifest_mime_type),
+                    album_replay_gain: data.album_replay_gain,
+                    album_peak_amplitude: data.album_peak_amplitude,
+                    track_replay_gain: data.track_replay_gain,
+                    track_peak_amplitude: data.track_peak_amplitude,
+                });
             }
         } else {
             return Err(format!("Unknown manifest format: {}", data.manifest_mime_type));
@@ -1001,6 +1122,7 @@ impl TidalClient {
 
         Ok(StreamInfo {
             url,
+            segments: vec![],
             codec,
             bit_depth: data.bit_depth,
             sample_rate: data.sample_rate,
@@ -1012,6 +1134,41 @@ impl TidalClient {
             track_replay_gain: data.track_replay_gain,
             track_peak_amplitude: data.track_peak_amplitude,
         })
+    }
+
+    /// Resolve a directly-streamable URL for a track, capped at `max_quality`.
+    /// Walks the quality ladder downward from the requested ceiling until Tidal
+    /// returns a single downloadable file (BTS or single-BaseURL DASH), so that
+    /// HI-RES tracks — which come back as segmented DASH — still play through
+    /// the proxy at the best format that can be served as one file.
+    pub async fn get_streamable_url(
+        &mut self,
+        track_id: u64,
+        max_quality: &str,
+    ) -> Result<StreamInfo, String> {
+        // Start at the requested ceiling, then step down.
+        let start = QUALITY_LADDER
+            .iter()
+            .position(|q| *q == max_quality)
+            .unwrap_or(0);
+
+        let mut last_err = String::from("No stream URL found");
+        for quality in &QUALITY_LADDER[start..] {
+            match self.get_stream_url(track_id, quality).await {
+                Ok(info) => return Ok(info),
+                Err(e) if e == DASH_SEGMENTED_ERR => {
+                    tracing::debug!(
+                        "Track {} segmented DASH at quality {}, trying lower quality",
+                        track_id,
+                        quality
+                    );
+                    last_err = "All qualities returned segmented DASH streams".to_string();
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err)
     }
 
     pub async fn get_track_lyrics(&mut self, track_id: u64) -> Result<TidalLyrics, String> {
@@ -1085,4 +1242,60 @@ fn is_direct_http_media_url(raw: &str) -> bool {
     }
     let path = url.path().to_ascii_lowercase();
     !path.ends_with('/') && !path.ends_with(".mpd")
+}
+
+/// Reconstruct the ordered list of segment URLs from a DASH `SegmentTemplate`
+/// (as used by TIDAL). The returned list is the init segment followed by every
+/// media segment; concatenating their bytes yields a single playable MP4/M4A.
+///
+/// Handles the `$Number$` placeholder with `startNumber` and a `SegmentTimeline`
+/// that expresses segment counts via `<S d=".." r="N"/>` (repeat) entries.
+fn extract_dash_segments(manifest: &str) -> Vec<String> {
+    let Ok(doc) = roxmltree::Document::parse(manifest) else {
+        return vec![];
+    };
+
+    for tmpl in doc
+        .descendants()
+        .filter(|n| n.has_tag_name("SegmentTemplate"))
+    {
+        let Some(media) = tmpl.attribute("media") else {
+            continue;
+        };
+        let init = tmpl.attribute("initialization");
+        let start_number: u64 = tmpl
+            .attribute("startNumber")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+
+        // Count media segments from the SegmentTimeline: each <S> contributes
+        // 1 + r segments (r defaults to 0).
+        let mut count: u64 = 0;
+        if let Some(timeline) = tmpl
+            .children()
+            .find(|c| c.has_tag_name("SegmentTimeline"))
+        {
+            for s in timeline.children().filter(|c| c.has_tag_name("S")) {
+                let r: i64 = s.attribute("r").and_then(|v| v.parse().ok()).unwrap_or(0);
+                // r can be negative (unknown/until-end); treat as a single segment.
+                count += 1 + r.max(0) as u64;
+            }
+        }
+
+        if count == 0 || !media.contains("$Number$") {
+            continue;
+        }
+
+        let mut urls = Vec::with_capacity(count as usize + 1);
+        if let Some(init) = init {
+            urls.push(init.to_string());
+        }
+        for i in 0..count {
+            let n = start_number + i;
+            urls.push(media.replace("$Number$", &n.to_string()));
+        }
+        return urls;
+    }
+
+    vec![]
 }

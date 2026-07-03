@@ -6,17 +6,17 @@ description = "A Subsonic-compatible API server backed by Tidal"
 
 [dependencies]
 # Web framework
-axum = "0.7"
+axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.5", features = ["cors"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 # HTTP client for Tidal API
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.11", features = ["json", "stream"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde-xml-rs = "0.6"
+quick-xml = { version = "0.36", features = ["serialize"] }
 
 # Auth
 md5 = "0.7"
@@ -30,13 +30,16 @@ dirs = "5"
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # URL handling
 url = "2"
 
 # XML parsing for DASH manifests
 roxmltree = "0.20"
+
+# Database
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Error handling
 anyhow = "1"

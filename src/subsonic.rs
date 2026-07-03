@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// Root Subsonic response element
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "subsonic-response")]
 pub struct SubsonicResponse {
     #[serde(rename = "@xmlns")]
     pub xmlns: String,
@@ -74,6 +75,36 @@ pub struct SubsonicResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "genres")]
     pub genres: Option<GenresWrapper>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "openSubsonicExtensions")]
+    pub open_subsonic_extensions: Option<Vec<OpenSubsonicExtension>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "directory")]
+    pub directory: Option<Directory>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Directory {
+    #[serde(rename = "@id")]
+    pub id: String,
+    #[serde(rename = "@name")]
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "@parent")]
+    pub parent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "@playCount")]
+    pub play_count: Option<u64>,
+    #[serde(rename = "child", default)]
+    pub child: Vec<SubsonicChild>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OpenSubsonicExtension {
+    #[serde(rename = "@name")]
+    pub name: String,
+    #[serde(rename = "versions")]
+    pub versions: Vec<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
