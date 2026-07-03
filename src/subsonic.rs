@@ -1,79 +1,185 @@
+use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 
-/// Root Subsonic response element
-#[derive(Debug, Serialize, Deserialize)]
+/// The single payload an endpoint attaches to a response. Each variant maps to
+/// exactly one Subsonic wire element/key (e.g. `albumList`, `searchResult3`).
+/// The response's manual `Serialize` impl emits the variant under that exact
+/// name, reproducing the historical per-field output byte-for-byte.
+#[derive(Debug)]
+pub enum Payload {
+    License(License),
+    MusicFolders(MusicFolders),
+    Indexes(Indexes),
+    Artists(ArtistsList),
+    Artist(ArtistWithAlbums),
+    Album(AlbumWithSongs),
+    Song(SubsonicSong),
+    AlbumList(AlbumList),
+    AlbumList2(AlbumList),
+    RandomSongs(SongList),
+    NowPlaying(NowPlaying),
+    /// getStarred emits both `<starred>` and `<starred2>` in one response.
+    Starred(Starred, Starred2),
+    SearchResult2(SearchResult2),
+    SearchResult3(SearchResult3),
+    Playlists(PlaylistsWrapper),
+    Playlist(PlaylistWithSongs),
+    User(SubsonicUser),
+    ScanStatus(ScanStatus),
+    Genres(GenresWrapper),
+    OpenSubsonicExtensions(Vec<OpenSubsonicExtension>),
+    Directory(Directory),
+}
+
+impl Payload {
+    /// Serialize the payload as one (or, for `Starred`, two) named field(s) of
+    /// the parent response struct, using the exact historical element/key names.
+    fn serialize_into<S: SerializeStruct>(&self, st: &mut S) -> Result<(), S::Error> {
+        match self {
+            Payload::License(v) => st.serialize_field("license", v),
+            Payload::MusicFolders(v) => st.serialize_field("musicFolders", v),
+            Payload::Indexes(v) => st.serialize_field("indexes", v),
+            Payload::Artists(v) => st.serialize_field("artists", v),
+            Payload::Artist(v) => st.serialize_field("artist", v),
+            Payload::Album(v) => st.serialize_field("album", v),
+            Payload::Song(v) => st.serialize_field("song", v),
+            Payload::AlbumList(v) => st.serialize_field("albumList", v),
+            Payload::AlbumList2(v) => st.serialize_field("albumList2", v),
+            Payload::RandomSongs(v) => st.serialize_field("randomSongs", v),
+            Payload::NowPlaying(v) => st.serialize_field("nowPlaying", v),
+            Payload::Starred(s, s2) => {
+                st.serialize_field("starred", s)?;
+                st.serialize_field("starred2", s2)
+            }
+            Payload::SearchResult2(v) => st.serialize_field("searchResult2", v),
+            Payload::SearchResult3(v) => st.serialize_field("searchResult3", v),
+            Payload::Playlists(v) => st.serialize_field("playlists", v),
+            Payload::Playlist(v) => st.serialize_field("playlist", v),
+            Payload::User(v) => st.serialize_field("user", v),
+            Payload::ScanStatus(v) => st.serialize_field("scanStatus", v),
+            Payload::Genres(v) => st.serialize_field("genres", v),
+            Payload::OpenSubsonicExtensions(v) => st.serialize_field("openSubsonicExtensions", v),
+            Payload::Directory(v) => st.serialize_field("directory", v),
+        }
+    }
+
+    /// Number of struct fields this payload contributes (2 only for `Starred`).
+    fn field_count(&self) -> usize {
+        match self {
+            Payload::Starred(_, _) => 2,
+            _ => 1,
+        }
+    }
+}
+
+/// Root Subsonic response element. Carries the six fixed metadata attributes,
+/// an optional error, and at most one payload. A hand-written `Serialize` impl
+/// emits the payload under its historical element/key name (quick-xml cannot
+/// `#[serde(flatten)]` an enum without losing the root tag).
+#[derive(Debug)]
 pub struct SubsonicResponse {
-    #[serde(rename = "@xmlns")]
     pub xmlns: String,
-    #[serde(rename = "@status")]
     pub status: String,
-    #[serde(rename = "@version")]
     pub version: String,
-    #[serde(rename = "@type")]
     pub server_type: String,
-    #[serde(rename = "@serverVersion")]
     pub server_version: String,
-    #[serde(rename = "@openSubsonic")]
     pub open_subsonic: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<SubsonicError>,
-    // One of the following may be present
+    pub payload: Option<Payload>,
+}
+
+const XMLNS: &str = "http://subsonic.org/restapi";
+const API_VERSION: &str = "1.16.1";
+const SERVER_NAME: &str = "tidal-subsonic";
+
+impl SubsonicResponse {
+    fn base(status: &str) -> Self {
+        SubsonicResponse {
+            xmlns: XMLNS.to_string(),
+            status: status.to_string(),
+            version: API_VERSION.to_string(),
+            server_type: SERVER_NAME.to_string(),
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
+            open_subsonic: true,
+            error: None,
+            payload: None,
+        }
+    }
+
+    /// A successful response with no payload (e.g. ping, scrobble).
+    pub fn ok() -> Self {
+        Self::base("ok")
+    }
+
+    /// A successful response carrying a single payload.
+    pub fn ok_with(payload: Payload) -> Self {
+        let mut r = Self::base("ok");
+        r.payload = Some(payload);
+        r
+    }
+
+    /// A failed response carrying a Subsonic error code and message.
+    pub fn error(code: u32, message: &str) -> Self {
+        let mut r = Self::base("failed");
+        r.error = Some(SubsonicError {
+            code,
+            message: message.to_string(),
+        });
+        r
+    }
+}
+
+impl Serialize for SubsonicResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Fixed six attributes + optional error + payload field(s). The field
+        // count must be exact for quick-xml. `@`-prefixed names become XML
+        // attributes; unprefixed become child elements (JSON strips the `@`).
+        let mut n = 6;
+        if self.error.is_some() {
+            n += 1;
+        }
+        if let Some(p) = &self.payload {
+            n += p.field_count();
+        }
+        let mut st = serializer.serialize_struct("subsonic-response", n)?;
+        st.serialize_field("@xmlns", &self.xmlns)?;
+        st.serialize_field("@status", &self.status)?;
+        st.serialize_field("@version", &self.version)?;
+        st.serialize_field("@type", &self.server_type)?;
+        st.serialize_field("@serverVersion", &self.server_version)?;
+        st.serialize_field("@openSubsonic", &self.open_subsonic)?;
+        if let Some(err) = &self.error {
+            st.serialize_field("error", err)?;
+        }
+        if let Some(p) = &self.payload {
+            p.serialize_into(&mut st)?;
+        }
+        st.end()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Directory {
+    #[serde(rename = "@id")]
+    pub id: String,
+    #[serde(rename = "@name")]
+    pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub license: Option<License>,
+    #[serde(rename = "@parent")]
+    pub parent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "musicFolders")]
-    pub music_folders: Option<MusicFolders>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub indexes: Option<Indexes>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub artists: Option<ArtistsList>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub artist: Option<ArtistWithAlbums>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub album: Option<AlbumWithSongs>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub song: Option<SubsonicSong>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "albumList")]
-    pub album_list: Option<AlbumList>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "albumList2")]
-    pub album_list2: Option<AlbumList>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "randomSongs")]
-    pub random_songs: Option<SongList>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "songsByGenre")]
-    pub songs_by_genre: Option<SongList>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "nowPlaying")]
-    pub now_playing: Option<NowPlaying>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub starred: Option<Starred>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub starred2: Option<Starred2>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "searchResult")]
-    pub search_result: Option<SearchResult>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "searchResult2")]
-    pub search_result2: Option<SearchResult2>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "searchResult3")]
-    pub search_result3: Option<SearchResult3>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub playlists: Option<PlaylistsWrapper>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub playlist: Option<PlaylistWithSongs>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "user")]
-    pub user: Option<SubsonicUser>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "scanStatus")]
-    pub scan_status: Option<ScanStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "genres")]
-    pub genres: Option<GenresWrapper>,
+    #[serde(rename = "@playCount")]
+    pub play_count: Option<u64>,
+    #[serde(rename = "child", default)]
+    pub child: Vec<SubsonicChild>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OpenSubsonicExtension {
+    #[serde(rename = "@name")]
+    pub name: String,
+    #[serde(rename = "versions")]
+    pub versions: Vec<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -379,17 +485,7 @@ pub struct Starred2 {
     pub song: Option<Vec<SubsonicChild>>,
 }
 
-// ------ Search ------ 
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct SearchResult {
-    #[serde(rename = "artist", default, skip_serializing_if = "Option::is_none")]
-    pub artist: Option<Vec<SubsonicArtist>>,
-    #[serde(rename = "album", default, skip_serializing_if = "Option::is_none")]
-    pub album: Option<Vec<SubsonicAlbum>>,
-    #[serde(rename = "song", default, skip_serializing_if = "Option::is_none")]
-    pub song: Option<Vec<SubsonicChild>>,
-}
+// ------ Search ------
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SearchResult2 {
