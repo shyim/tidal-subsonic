@@ -7,7 +7,7 @@ mod mapping;
 mod response;
 mod routes;
 mod subsonic;
-mod tidal_client;
+mod tidal;
 
 use app::AppState;
 use axum::routing::get;
@@ -15,7 +15,7 @@ use reqwest::Client as ReqwestClient;
 use routes::{browsing, fallback, lists, media, playlists, search, system};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tidal_client::{SharedTidalClient, TidalClient};
+use tidal::{SharedTidalClient, TidalClient};
 use tower_http::trace::TraceLayer;
 
 /// Register a Subsonic endpoint under both the bare `/rest/<name>` path and the

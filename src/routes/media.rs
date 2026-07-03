@@ -1,7 +1,7 @@
 use crate::auth_mw::{render_current, xml_error, Authed};
 use crate::item_id::ItemId;
 use crate::mapping;
-use crate::tidal_client::StreamInfo;
+use crate::tidal::StreamInfo;
 use axum::{
     http::{header, StatusCode},
     response::{IntoResponse, Response},

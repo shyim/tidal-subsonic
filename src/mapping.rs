@@ -1,6 +1,6 @@
 use crate::item_id::ItemId;
 use crate::subsonic::*;
-use crate::tidal_client::*;
+use crate::tidal::*;
 
 /// Extract the primary artist name and TIDAL id from an album detail, preferring
 /// the singular `artist` field and falling back to the first entry of `artists`.

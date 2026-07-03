@@ -3,7 +3,7 @@ use crate::auth_mw::{xml_ok, ApiError, ApiOk, ApiResult, Authed};
 use crate::item_id::ItemId;
 use crate::mapping;
 use crate::subsonic::*;
-use crate::tidal_client::TidalClient;
+use crate::tidal::TidalClient;
 use axum::http::HeaderMap;
 
 pub(crate) async fn handle_get_random_songs(authed: Authed, headers: HeaderMap) -> ApiResult {

@@ -1,7 +1,7 @@
 use crate::app::{AppState, SubsonicParams};
 use crate::response::{self, ResponseFormat};
 use crate::subsonic::{Payload, SubsonicResponse};
-use crate::tidal_client::SharedTidalClient;
+use crate::tidal::SharedTidalClient;
 use axum::{
     extract::{FromRequestParts, Query},
     http::request::Parts,

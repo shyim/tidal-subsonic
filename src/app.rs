@@ -1,7 +1,7 @@
 use crate::auth::PkceSession;
 use crate::db::SharedDb;
 use crate::response::ResponseFormat;
-use crate::tidal_client::SharedTidalClient;
+use crate::tidal::SharedTidalClient;
 use axum::http::HeaderMap;
 use reqwest::Client as ReqwestClient;
 use serde::Deserialize;
