@@ -4,4 +4,5 @@
 
 mod events;
 mod library;
+mod mixes;
 mod streaming;

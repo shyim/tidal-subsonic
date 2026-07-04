@@ -8,6 +8,9 @@ use std::str::FromStr;
 ///   - `al-<u64>`  an album
 ///   - `ar-<u64>`  an artist
 ///   - `pl-<uuid>` a playlist (TIDAL playlists are UUID strings, not numeric)
+///   - `mix-<id>` a TIDAL generated mix (surfaced as a playlist; id is a hex
+///     string). Distinct prefix so `getPlaylist` routes mix ids to the
+///     mix-tracks endpoint instead of the playlist one.
 ///
 /// `FromStr` parses those prefixes and `Display` re-emits them, so the exact
 /// wire format is centralised here instead of scattered `strip_prefix` /
@@ -18,6 +21,7 @@ pub enum ItemId {
     Album(u64),
     Artist(u64),
     Playlist(String),
+    Mix(String),
 }
 
 impl fmt::Display for ItemId {
@@ -27,6 +31,7 @@ impl fmt::Display for ItemId {
             ItemId::Album(id) => write!(f, "al-{}", id),
             ItemId::Artist(id) => write!(f, "ar-{}", id),
             ItemId::Playlist(uuid) => write!(f, "pl-{}", uuid),
+            ItemId::Mix(id) => write!(f, "mix-{}", id),
         }
     }
 }
@@ -43,6 +48,10 @@ impl FromStr for ItemId {
         }
         if let Some(rest) = s.strip_prefix("ar-") {
             return rest.parse().map(ItemId::Artist).map_err(|_| ());
+        }
+        // `mix-` before `pl-`? No overlap, but check the longer/distinct prefix.
+        if let Some(rest) = s.strip_prefix("mix-") {
+            return Ok(ItemId::Mix(rest.to_string()));
         }
         if let Some(rest) = s.strip_prefix("pl-") {
             return Ok(ItemId::Playlist(rest.to_string()));

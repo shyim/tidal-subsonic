@@ -16,10 +16,15 @@ pub(crate) async fn handle_get_playlists(authed: Authed) -> ApiResult {
         .metadata_cache
         .get_or_build(&key, TTL_FAVORITES, || async {
             let playlists = client.get_all_user_playlists(user_id).await?;
-            let sub_playlists: Vec<SubsonicPlaylist> = playlists
+            let mut sub_playlists: Vec<SubsonicPlaylist> = playlists
                 .iter()
                 .map(mapping::playlist_to_subsonic)
                 .collect();
+            // Append TIDAL's generated mixes (Daily Mix, My Mix, …) as playlists.
+            // Best-effort: if the mixes endpoint fails, still return the real ones.
+            if let Ok(mixes) = client.get_my_mixes().await {
+                sub_playlists.extend(mixes.iter().map(mapping::mix_to_subsonic_playlist));
+            }
             Ok(PlaylistsWrapper {
                 playlist: sub_playlists,
             })
@@ -89,17 +94,56 @@ fn parse_track_id(id: &str) -> Option<u64> {
 }
 
 pub(crate) async fn handle_get_playlist(authed: Authed, headers: HeaderMap) -> ApiResult {
-    let playlist_id_str = authed
+    let id_str = authed
         .params
         .id
         .as_deref()
         .ok_or_else(|| ApiError::BadRequest(10, "Missing playlist id".to_string()))?;
-    let playlist_uuid = parse_playlist_id(playlist_id_str)?;
 
     let client = authed.tidal().await?;
     let base_url = base_url_from_headers(&headers);
-    let playlist = build_playlist_response(&client, &playlist_uuid, &base_url).await?;
+
+    // A `mix-` id is one of TIDAL's generated mixes — fetch its tracks from the
+    // mix endpoint rather than the user-playlist endpoint.
+    let playlist = match id_str.parse::<ItemId>() {
+        Ok(ItemId::Mix(mix_id)) => build_mix_response(&client, &mix_id, &base_url).await?,
+        _ => {
+            let uuid = parse_playlist_id(id_str)?;
+            build_playlist_response(&client, &uuid, &base_url).await?
+        }
+    };
     Ok(Payload::Playlist(playlist).into())
+}
+
+/// Build the `getPlaylist` response for a TIDAL generated mix.
+async fn build_mix_response(
+    client: &SharedTidalClient,
+    mix_id: &str,
+    base_url: &str,
+) -> Result<PlaylistWithSongs, ApiError> {
+    let detail = client
+        .get_mix_tracks(mix_id)
+        .await
+        .map_err(ApiError::Tidal)?;
+    let songs: Vec<SubsonicChild> = detail
+        .tracks
+        .iter()
+        .map(|t| mapping::track_to_child(t, base_url))
+        .collect();
+    let cover_art = songs.first().and_then(|s| s.cover_art.clone());
+    Ok(PlaylistWithSongs {
+        id: ItemId::Mix(mix_id.to_string()).to_string(),
+        name: detail.title.unwrap_or_else(|| "Mix".to_string()),
+        comment: None,
+        owner: Some("TIDAL".to_string()),
+        public: Some(false),
+        song_count: Some(songs.len() as u32),
+        duration: Some(songs.iter().filter_map(|s| s.duration).sum()),
+        created: None,
+        changed: None,
+        cover_art,
+        entry: songs,
+    })
 }
 
 pub(crate) async fn handle_create_playlist(authed: Authed, headers: HeaderMap) -> ApiResult {

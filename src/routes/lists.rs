@@ -166,7 +166,7 @@ pub(crate) async fn handle_star(authed: Authed) -> ApiResult {
             ItemId::Track(id) => client.add_favorite_track(id).await,
             ItemId::Album(id) => client.add_favorite_album(id).await,
             ItemId::Artist(id) => client.add_favorite_artist(id).await,
-            ItemId::Playlist(_) => Ok(()),
+            ItemId::Playlist(_) | ItemId::Mix(_) => Ok(()),
         };
         res.map_err(|e| ApiError::Tidal(format!("Star failed: {}", e)))?;
     }
@@ -184,7 +184,7 @@ pub(crate) async fn handle_unstar(authed: Authed) -> ApiResult {
             ItemId::Track(id) => client.remove_favorite_track(id).await,
             ItemId::Album(id) => client.remove_favorite_album(id).await,
             ItemId::Artist(id) => client.remove_favorite_artist(id).await,
-            ItemId::Playlist(_) => Ok(()),
+            ItemId::Playlist(_) | ItemId::Mix(_) => Ok(()),
         };
         res.map_err(|e| ApiError::Tidal(format!("Unstar failed: {}", e)))?;
     }

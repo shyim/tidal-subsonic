@@ -242,6 +242,36 @@ pub struct StreamInfo {
     pub track_peak_amplitude: Option<f64>,
 }
 
+/// A TIDAL generated mix (Daily Mix, My Mix, Discovery, …), as returned by the
+/// `pages/my_collection_my_mixes` MIX_LIST. Surfaced to Subsonic as a playlist.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TidalMix {
+    pub id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub sub_title: Option<String>,
+    #[serde(default)]
+    pub mix_type: Option<String>,
+    /// `{ SMALL|MEDIUM|LARGE: { url } }`
+    #[serde(default)]
+    pub images: Option<serde_json::Value>,
+}
+
+impl TidalMix {
+    /// Best cover image URL (LARGE → MEDIUM → SMALL).
+    pub fn image_url(&self) -> Option<String> {
+        let imgs = self.images.as_ref()?;
+        for size in ["LARGE", "MEDIUM", "SMALL"] {
+            if let Some(u) = imgs.get(size).and_then(|s| s.get("url")).and_then(|u| u.as_str()) {
+                return Some(u.to_string());
+            }
+        }
+        None
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TidalLyrics {
     #[serde(default)]

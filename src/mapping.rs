@@ -293,6 +293,23 @@ pub fn playlist_to_subsonic(playlist: &TidalPlaylist) -> SubsonicPlaylist {
     }
 }
 
+/// Map a TIDAL generated mix to a Subsonic playlist entry. Track count/duration
+/// aren't in the mix list (they need a separate fetch), so they're left unset.
+pub fn mix_to_subsonic_playlist(mix: &crate::tidal::TidalMix) -> SubsonicPlaylist {
+    SubsonicPlaylist {
+        id: ItemId::Mix(mix.id.clone()).to_string(),
+        name: mix.title.clone().unwrap_or_else(|| "Mix".to_string()),
+        comment: mix.sub_title.clone(),
+        owner: Some("TIDAL".to_string()),
+        public: Some(false),
+        song_count: None,
+        duration: None,
+        created: None,
+        changed: None,
+        cover_art: mix.image_url().map(|u| cover_art_id(&u)),
+    }
+}
+
 pub fn build_indexes(artists: &[TidalArtistDetail]) -> Indexes {
     let mut indexes: std::collections::BTreeMap<char, Vec<SubsonicArtist>> =
         std::collections::BTreeMap::new();

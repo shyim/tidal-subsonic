@@ -34,7 +34,9 @@ async fn artist_id_for(client: &SharedTidalClient, id: &ItemId) -> Result<u64, A
                 .or_else(|| track.artists.as_ref().and_then(|v| v.first()).map(|a| a.id))
                 .ok_or_else(|| ApiError::Tidal("Track has no artist".to_string()))
         }
-        ItemId::Playlist(_) => Err(ApiError::BadRequest(0, "Invalid id for this operation".into())),
+        ItemId::Playlist(_) | ItemId::Mix(_) => {
+            Err(ApiError::BadRequest(0, "Invalid id for this operation".into()))
+        }
     }
 }
 

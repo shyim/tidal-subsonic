@@ -777,3 +777,4 @@ impl TidalClient {
         Ok(())
     }
 }
+
