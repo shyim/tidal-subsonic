@@ -136,31 +136,31 @@ pub async fn master_cipher(db: &SharedDb) -> Cipher {
 /// One-time migration: fold the legacy single-user config credential and
 /// `tidal_tokens(id=1)` into a `users` row (admin) + `tidal_accounts` row.
 /// No-op once any user exists.
+/// On an empty `users` table, either migrate a legacy single-user install or
+/// bootstrap the first admin. A legacy install is detected by an explicit
+/// `subsonic_username` config row or existing `tidal_tokens`; those keep their
+/// original password. A truly fresh install must NOT get a known default
+/// password: the admin password comes from `TIDAL_SUBSONIC_ADMIN_PASSWORD`, or a
+/// random one is generated and printed to the log once.
 pub async fn migrate_single_user(db: &SharedDb, cipher: &Cipher) -> Result<()> {
     let conn = db.lock().await;
 
-    let user_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
+    let user_count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
     if user_count > 0 {
         return Ok(());
     }
 
-    // Legacy Subsonic credential lived in config (defaults tidal/tidal).
-    let username = config_str(&conn, "subsonic_username", "tidal");
-    let password = config_str(&conn, "subsonic_password", "tidal");
-
-    conn.execute(
-        "INSERT INTO users (username, password_encrypted, is_admin)
-         VALUES (?1, ?2, 1)",
-        params![username, cipher.encrypt(&password)],
-    )?;
-    let user_id = conn.last_insert_rowid();
-    tracing::info!("Migrated single user '{}' to multi-user schema (admin, id {})", username, user_id);
-
-    // Migrate the legacy TIDAL tokens, if any.
-    let tokens = conn
+    // Did a legacy single-user setup exist? (explicit config username, or tokens)
+    let legacy_username: Option<String> = conn
         .query_row(
-            "SELECT access_token, refresh_token, user_id, country_code FROM tidal_tokens WHERE id = 1",
+            "SELECT value FROM config WHERE key = 'subsonic_username'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let legacy_tokens = conn
+        .query_row(
+            "SELECT access_token, refresh_token, user_id, country_code FROM tidal_tokens WHERE id = 1 AND access_token != ''",
             [],
             |row| {
                 Ok((
@@ -172,17 +172,66 @@ pub async fn migrate_single_user(db: &SharedDb, cipher: &Cipher) -> Result<()> {
             },
         )
         .optional()?;
-    if let Some((at, rt, tuid, cc)) = tokens {
-        if !at.is_empty() {
-            conn.execute(
-                "INSERT INTO tidal_accounts (user_id, access_token, refresh_token, tidal_user_id, country_code)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![user_id, cipher.encrypt(&at), cipher.encrypt(&rt), tuid, cc],
-            )?;
-            tracing::info!("Migrated TIDAL account for user {}", user_id);
-        }
+    let is_legacy = legacy_username.is_some() || legacy_tokens.is_some();
+
+    let (username, password) = if is_legacy {
+        // Preserve the legacy credential.
+        let u = legacy_username.unwrap_or_else(|| "tidal".to_string());
+        let p = config_str(&conn, "subsonic_password", "tidal");
+        (u, p)
+    } else {
+        // Fresh install: never use a known default password.
+        let u = "admin".to_string();
+        let p = match std::env::var("TIDAL_SUBSONIC_ADMIN_PASSWORD") {
+            Ok(v) if !v.is_empty() => v,
+            _ => {
+                let generated = random_password();
+                tracing::warn!(
+                    "First run: created admin user 'admin' with generated password: {}  \
+                     (set TIDAL_SUBSONIC_ADMIN_PASSWORD to choose your own; change it after login)",
+                    generated
+                );
+                generated
+            }
+        };
+        (u, p)
+    };
+
+    conn.execute(
+        "INSERT INTO users (username, password_encrypted, is_admin) VALUES (?1, ?2, 1)",
+        params![username, cipher.encrypt(&password)],
+    )?;
+    let user_id = conn.last_insert_rowid();
+    if is_legacy {
+        tracing::info!(
+            "Migrated single user '{}' to multi-user schema (admin, id {})",
+            username,
+            user_id
+        );
+    } else {
+        tracing::info!("Bootstrapped first admin user 'admin' (id {})", user_id);
+    }
+
+    // Migrate legacy TIDAL tokens, if any.
+    if let Some((at, rt, tuid, cc)) = legacy_tokens {
+        conn.execute(
+            "INSERT INTO tidal_accounts (user_id, access_token, refresh_token, tidal_user_id, country_code)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![user_id, cipher.encrypt(&at), cipher.encrypt(&rt), tuid, cc],
+        )?;
+        tracing::info!("Migrated TIDAL account for user {}", user_id);
     }
     Ok(())
+}
+
+/// Generate a random, human-typable admin password (no ambiguous characters).
+fn random_password() -> String {
+    use rand::Rng;
+    const CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+    let mut rng = rand::thread_rng();
+    (0..20)
+        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+        .collect()
 }
 
 fn config_str(conn: &Connection, key: &str, default: &str) -> String {
