@@ -1,3 +1,11 @@
 /target
 **/*.rs.bk
-Cargo.lock
+
+# Frontend build: node_modules is regenerated; Cargo.lock IS committed (this is a
+# binary crate, so the lockfile is versioned for reproducible builds).
+web/node_modules/
+
+# Local runtime data — never commit (contains encrypted tokens + the master key).
+*.db
+*.db-journal
+*.sqlite
