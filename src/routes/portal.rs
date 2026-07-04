@@ -28,14 +28,14 @@ pub(crate) fn api_routes() -> Router<AppState> {
         .route("/api/unlink", post(unlink))
         .route("/api/password", post(change_password))
         .route("/api/users", get(list_users).post(create_user))
-        .route("/api/users/:name", post(update_user).delete(delete_user))
+        .route("/api/users/{name}", post(update_user).delete(delete_user))
 }
 
 // ---- session plumbing ----
 
 fn random_token() -> String {
-    let mut rng = rand::thread_rng();
-    let bytes: [u8; 24] = rng.gen();
+    let mut rng = rand::rng();
+    let bytes: [u8; 24] = rng.random();
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
@@ -78,7 +78,6 @@ fn is_https(headers: &HeaderMap) -> bool {
 /// Extractor: the authenticated portal session, or 401.
 struct Session(WebSession);
 
-#[axum::async_trait]
 impl FromRequestParts<AppState> for Session {
     type Rejection = Response;
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Response> {

@@ -16,7 +16,7 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// A random UUID v4 string, from `rand` (no uuid crate needed).
 fn uuid_v4() -> String {
-    let mut b: [u8; 16] = rand::thread_rng().gen();
+    let mut b: [u8; 16] = rand::rng().random();
     b[6] = (b[6] & 0x0f) | 0x40; // version 4
     b[8] = (b[8] & 0x3f) | 0x80; // variant 1
     format!(
