@@ -41,6 +41,10 @@ pub fn to_rfc3339(raw: &str) -> String {
     if s.len() == 10 && !s.contains('T') {
         return format!("{s}T00:00:00Z");
     }
+    // SQLite `datetime('now')`: `YYYY-MM-DD HH:MM:SS` (space, no zone) — UTC.
+    if s.len() == 19 && s.as_bytes()[10] == b' ' && !s.contains(['+', 'Z']) {
+        return format!("{}T{}Z", &s[..10], &s[11..]);
+    }
     // A trailing numeric offset without a colon: `+0000` / `-0500`.
     if let Some(pos) = s.rfind(['+', '-']).filter(|&p| p >= s.len().saturating_sub(5)) {
         let (head, off) = s.split_at(pos);
@@ -396,6 +400,8 @@ mod tests {
             to_rfc3339("2026-05-02T07:00:44-0500"),
             "2026-05-02T07:00:44-05:00"
         );
+        // SQLite datetime('now'): space-separated, no zone -> T…Z.
+        assert_eq!(to_rfc3339("2026-07-04 13:45:01"), "2026-07-04T13:45:01Z");
         // Already valid — pass through untouched.
         assert_eq!(to_rfc3339("2009-06-09T00:00:00Z"), "2009-06-09T00:00:00Z");
         assert_eq!(to_rfc3339("2026-05-02T07:00:44+00:00"), "2026-05-02T07:00:44+00:00");

@@ -72,7 +72,7 @@ pub(crate) async fn handle_get_play_queue(authed: Authed, headers: HeaderMap) ->
         current: row.current,
         position: Some(row.position_ms),
         username: authed.user.username.clone(),
-        changed: Some(row.changed_at),
+        changed: Some(crate::mapping::to_rfc3339(&row.changed_at)),
         changed_by: row.changed_by,
         entry: entries,
     })
@@ -118,8 +118,8 @@ pub(crate) async fn handle_get_bookmarks(authed: Authed, headers: HeaderMap) -> 
                 position: row.position_ms,
                 username: authed.user.username.clone(),
                 comment: row.comment,
-                created: Some(row.created_at),
-                changed: Some(row.changed_at),
+                created: Some(crate::mapping::to_rfc3339(&row.created_at)),
+                changed: Some(crate::mapping::to_rfc3339(&row.changed_at)),
                 entry,
             });
         }

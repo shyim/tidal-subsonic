@@ -70,8 +70,16 @@ async fn build_playlist_response(
         public: meta.as_ref().and_then(|p| p.public_playlist),
         song_count: Some(songs.len() as u32),
         duration: meta.as_ref().and_then(|p| p.duration),
-        created: meta.as_ref().and_then(|p| p.created.clone()),
-        changed: meta.as_ref().and_then(|p| p.last_updated.clone()),
+        // Normalize to strict RFC 3339 — go-subsonic (Supersonic) errors the whole
+        // response otherwise. Matches the getPlaylists list path.
+        created: meta
+            .as_ref()
+            .and_then(|p| p.created.clone())
+            .map(|d| mapping::to_rfc3339(&d)),
+        changed: meta
+            .as_ref()
+            .and_then(|p| p.last_updated.clone())
+            .map(|d| mapping::to_rfc3339(&d)),
         cover_art,
         entry: songs,
     })
