@@ -13,7 +13,7 @@ mod tidal;
 use app::AppState;
 use axum::routing::get;
 use reqwest::Client as ReqwestClient;
-use routes::{browsing, fallback, lists, media, playlists, search, system, users};
+use routes::{browsing, fallback, lists, lyrics, media, playlists, search, system, users};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
@@ -81,6 +81,7 @@ async fn main() {
         pkce_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         max_quality: max_quality.clone(),
         media_cache: routes::media_cache::MediaCache::open(),
+        metadata_cache: routes::metadata_cache::MetadataCache::new(),
     };
 
     let mut app = auth::auth_routes();
@@ -96,6 +97,8 @@ async fn main() {
         ("getMusicDirectory", get(browsing::handle_get_music_directory)),
         ("getAlbum", get(browsing::handle_get_album)),
         ("getSong", get(browsing::handle_get_song)),
+        ("getLyrics", get(lyrics::handle_get_lyrics)),
+        ("getLyricsBySongId", get(lyrics::handle_get_lyrics_by_song_id)),
         ("getRandomSongs", get(lists::handle_get_random_songs)),
         ("getAlbumList", get(lists::handle_get_album_list)),
         ("getAlbumList2", get(lists::handle_get_album_list2)),

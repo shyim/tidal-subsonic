@@ -30,6 +30,10 @@ pub enum Payload {
     Genres(GenresWrapper),
     OpenSubsonicExtensions(Vec<OpenSubsonicExtension>),
     Directory(Directory),
+    /// Classic Subsonic `getLyrics` result: `<lyrics artist=".." title="..">TEXT</lyrics>`.
+    Lyrics(Lyrics),
+    /// OpenSubsonic `getLyricsBySongId` result: a structured `<lyricsList>`.
+    LyricsList(LyricsList),
 }
 
 impl Payload {
@@ -62,6 +66,8 @@ impl Payload {
             Payload::Genres(v) => st.serialize_field("genres", v),
             Payload::OpenSubsonicExtensions(v) => st.serialize_field("openSubsonicExtensions", v),
             Payload::Directory(v) => st.serialize_field("directory", v),
+            Payload::Lyrics(v) => st.serialize_field("lyrics", v),
+            Payload::LyricsList(v) => st.serialize_field("lyricsList", v),
         }
     }
 
@@ -692,6 +698,54 @@ pub struct SubsonicGenre {
     pub song_count: u64,
     #[serde(rename = "@albumCount")]
     pub album_count: u64,
+    #[serde(rename = "$value")]
+    pub value: String,
+}
+
+// ------ Lyrics ------
+
+/// Classic Subsonic `getLyrics` payload: `<lyrics artist=".." title="..">TEXT</lyrics>`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Lyrics {
+    #[serde(rename = "@artist", skip_serializing_if = "Option::is_none")]
+    pub artist: Option<String>,
+    #[serde(rename = "@title", skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(rename = "$value", default, skip_serializing_if = "String::is_empty")]
+    pub value: String,
+}
+
+/// OpenSubsonic `getLyricsBySongId` payload: `<lyricsList>` holding zero or more
+/// `<structuredLyrics>` blocks (one per language / synced-or-not variant).
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct LyricsList {
+    #[serde(rename = "structuredLyrics", default)]
+    pub structured_lyrics: Vec<StructuredLyrics>,
+}
+
+/// One `<structuredLyrics>` block: either synced (each line timestamped) or
+/// plain (a single untimed line holding the whole lyric).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct StructuredLyrics {
+    #[serde(rename = "@lang")]
+    pub lang: String,
+    #[serde(rename = "@synced")]
+    pub synced: bool,
+    #[serde(rename = "@displayArtist", skip_serializing_if = "Option::is_none")]
+    pub display_artist: Option<String>,
+    #[serde(rename = "@displayTitle", skip_serializing_if = "Option::is_none")]
+    pub display_title: Option<String>,
+    #[serde(rename = "@offset", skip_serializing_if = "Option::is_none")]
+    pub offset: Option<i64>,
+    #[serde(rename = "line", default)]
+    pub line: Vec<LyricLine>,
+}
+
+/// One `<line>` of structured lyrics; `start` is the ms offset for synced lines.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LyricLine {
+    #[serde(rename = "@start", skip_serializing_if = "Option::is_none")]
+    pub start: Option<i64>,
     #[serde(rename = "$value")]
     pub value: String,
 }

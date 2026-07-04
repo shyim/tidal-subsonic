@@ -3,6 +3,7 @@ use crate::crypto::Cipher;
 use crate::db::SharedDb;
 use crate::response::ResponseFormat;
 use crate::routes::media_cache::MediaCache;
+use crate::routes::metadata_cache::MetadataCache;
 use crate::tidal::ClientRegistry;
 use axum::http::HeaderMap;
 use reqwest::Client as ReqwestClient;
@@ -20,6 +21,8 @@ pub(crate) struct AppState {
     pub(crate) pkce_sessions: Arc<tokio::sync::Mutex<HashMap<String, PkceSession>>>,
     pub(crate) max_quality: String,
     pub(crate) media_cache: MediaCache,
+    /// Per-user in-memory cache for browse/search/list responses.
+    pub(crate) metadata_cache: MetadataCache,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -126,6 +129,20 @@ pub(crate) struct SubsonicParams {
     pub(crate) email: Option<String>,
     #[serde(default, rename = "adminRole")]
     pub(crate) admin_role: Option<bool>,
+    // getLyrics (classic) params: artist + title of the track.
+    #[serde(default)]
+    pub(crate) artist: Option<String>,
+    #[serde(default)]
+    pub(crate) title: Option<String>,
+    // Playlist-editing params (createPlaylist/updatePlaylist).
+    #[serde(default, rename = "playlistId")]
+    pub(crate) playlist_id: Option<String>,
+    #[serde(default)]
+    pub(crate) comment: Option<String>,
+    #[serde(default, rename = "songIdToAdd")]
+    pub(crate) song_id_to_add: Option<Vec<String>>,
+    #[serde(default, rename = "songIndexToRemove")]
+    pub(crate) song_index_to_remove: Option<Vec<u32>>,
 }
 
 impl SubsonicParams {

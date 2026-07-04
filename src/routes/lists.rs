@@ -2,6 +2,7 @@ use crate::app::{base_url_from_headers, SubsonicParams};
 use crate::auth_mw::{xml_ok, ApiError, ApiOk, ApiResult, Authed};
 use crate::item_id::ItemId;
 use crate::mapping;
+use crate::routes::metadata_cache::{MetadataCache, TTL_FAVORITES};
 use crate::subsonic::*;
 use crate::tidal::SharedTidalClient;
 use axum::http::HeaderMap;
@@ -62,25 +63,40 @@ async fn fetch_album_list(
     Ok(sub_albums)
 }
 
-pub(crate) async fn handle_get_album_list(authed: Authed) -> ApiResult {
-    let list_type = authed.params.list_type.as_deref().unwrap_or("alphabeticalByName");
+/// Fetch the album list for `getAlbumList`/`getAlbumList2`, memoized per user by
+/// `(type, size, offset)`. Favorites-backed, so it uses the short TTL and is
+/// cleared on star/unstar.
+async fn cached_album_list(authed: &Authed) -> Result<Vec<SubsonicAlbum>, ApiError> {
+    let list_type = authed
+        .params
+        .list_type
+        .as_deref()
+        .unwrap_or("alphabeticalByName");
     let size = authed.params.size.unwrap_or(10).min(500);
     let offset = authed.params.offset.unwrap_or(0);
     let client = authed.tidal().await?;
-    let sub_albums = fetch_album_list(&client, list_type, size, offset)
+    let key = MetadataCache::key(
+        authed.user.id,
+        "getAlbumList",
+        &format!("type={list_type}&size={size}&offset={offset}"),
+    );
+    authed
+        .state
+        .metadata_cache
+        .get_or_build(&key, TTL_FAVORITES, || {
+            fetch_album_list(&client, list_type, size, offset)
+        })
         .await
-        .map_err(ApiError::Tidal)?;
+        .map_err(ApiError::Tidal)
+}
+
+pub(crate) async fn handle_get_album_list(authed: Authed) -> ApiResult {
+    let sub_albums = cached_album_list(&authed).await?;
     Ok(Payload::AlbumList(AlbumList { album: sub_albums }).into())
 }
 
 pub(crate) async fn handle_get_album_list2(authed: Authed) -> ApiResult {
-    let list_type = authed.params.list_type.as_deref().unwrap_or("alphabeticalByName");
-    let size = authed.params.size.unwrap_or(10).min(500);
-    let offset = authed.params.offset.unwrap_or(0);
-    let client = authed.tidal().await?;
-    let sub_albums = fetch_album_list(&client, list_type, size, offset)
-        .await
-        .map_err(ApiError::Tidal)?;
+    let sub_albums = cached_album_list(&authed).await?;
     Ok(Payload::AlbumList2(AlbumList { album: sub_albums }).into())
 }
 
@@ -158,6 +174,9 @@ pub(crate) async fn handle_star(authed: Authed) -> ApiResult {
         };
         res.map_err(|e| ApiError::Tidal(format!("Star failed: {}", e)))?;
     }
+    // Favorites changed: drop this user's cached favorites/starred/albumList/
+    // artists views so their next request reflects the new star.
+    authed.state.metadata_cache.invalidate_user(authed.user.id).await;
     Ok(ApiOk(xml_ok()))
 }
 
@@ -173,5 +192,6 @@ pub(crate) async fn handle_unstar(authed: Authed) -> ApiResult {
         };
         res.map_err(|e| ApiError::Tidal(format!("Unstar failed: {}", e)))?;
     }
+    authed.state.metadata_cache.invalidate_user(authed.user.id).await;
     Ok(ApiOk(xml_ok()))
 }

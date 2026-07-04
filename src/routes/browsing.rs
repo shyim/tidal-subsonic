@@ -2,6 +2,7 @@ use crate::app::base_url_from_headers;
 use crate::auth_mw::{ApiError, ApiResult, Authed};
 use crate::item_id::ItemId;
 use crate::mapping;
+use crate::routes::metadata_cache::{MetadataCache, TTL_CATALOG, TTL_FAVORITES};
 use crate::subsonic::*;
 use axum::http::HeaderMap;
 
@@ -18,16 +19,21 @@ pub(crate) async fn handle_get_indexes(authed: Authed) -> ApiResult {
 pub(crate) async fn handle_get_artists(authed: Authed) -> ApiResult {
     let client = authed.tidal().await?;
     let user_id = authed.tidal_user_id().await?;
-    let artists = client
-        .get_favorite_artists(user_id, 0, 500)
+    let key = MetadataCache::key(authed.user.id, "getArtists", "");
+    let list = authed
+        .state
+        .metadata_cache
+        .get_or_build(&key, TTL_FAVORITES, || async {
+            let artists = client.get_favorite_artists(user_id, 0, 500).await?;
+            let indexes = mapping::build_indexes(&artists.items);
+            Ok(ArtistsList {
+                ignored_articles: indexes.ignored_articles,
+                index: indexes.index,
+            })
+        })
         .await
         .map_err(ApiError::Tidal)?;
-    let indexes = mapping::build_indexes(&artists.items);
-    Ok(Payload::Artists(ArtistsList {
-        ignored_articles: indexes.ignored_articles,
-        index: indexes.index,
-    })
-    .into())
+    Ok(Payload::Artists(list).into())
 }
 
 pub(crate) async fn handle_get_artist(authed: Authed) -> ApiResult {
@@ -42,25 +48,30 @@ pub(crate) async fn handle_get_artist(authed: Authed) -> ApiResult {
     };
 
     let client = authed.tidal().await?;
-    let artist_detail = client
-        .get_artist_detail(artist_id)
+    let key = MetadataCache::key(authed.user.id, "getArtist", &format!("id={artist_id}"));
+    let artist = authed
+        .state
+        .metadata_cache
+        .get_or_build(&key, TTL_CATALOG, || async {
+            let artist_detail = client.get_artist_detail(artist_id).await?;
+            let sub_artist = mapping::artist_to_subsonic(&artist_detail);
+            let mut sub_albums = Vec::new();
+            if let Ok(albums) = client.get_artist_albums(artist_id, 0, 100).await {
+                sub_albums = albums.items.iter().map(|a| mapping::album_to_subsonic(a)).collect();
+            }
+            Ok(ArtistWithAlbums {
+                id: sub_artist.id,
+                name: sub_artist.name,
+                cover_art: sub_artist.cover_art,
+                album_count: Some(sub_albums.len() as u32),
+                artist_image_url: sub_artist.artist_image_url,
+                starred: None,
+                album: sub_albums,
+            })
+        })
         .await
         .map_err(ApiError::Tidal)?;
-    let sub_artist = mapping::artist_to_subsonic(&artist_detail);
-    let mut sub_albums = Vec::new();
-    if let Ok(albums) = client.get_artist_albums(artist_id, 0, 100).await {
-        sub_albums = albums.items.iter().map(|a| mapping::album_to_subsonic(a)).collect();
-    }
-    Ok(Payload::Artist(ArtistWithAlbums {
-        id: sub_artist.id,
-        name: sub_artist.name,
-        cover_art: sub_artist.cover_art,
-        album_count: Some(sub_albums.len() as u32),
-        artist_image_url: sub_artist.artist_image_url,
-        starred: None,
-        album: sub_albums,
-    })
-    .into())
+    Ok(Payload::Artist(artist).into())
 }
 
 pub(crate) async fn handle_get_album(authed: Authed, headers: HeaderMap) -> ApiResult {
@@ -76,22 +87,30 @@ pub(crate) async fn handle_get_album(authed: Authed, headers: HeaderMap) -> ApiR
 
     let client = authed.tidal().await?;
     let base_url = base_url_from_headers(&headers);
-    let album = client
-        .get_album_detail(album_id)
+    // base_url is baked into stream/cover URLs in the mapped songs, so it is part
+    // of the key — a request from a different host must not reuse another's URLs.
+    let key = MetadataCache::key(
+        authed.user.id,
+        "getAlbum",
+        &format!("id={album_id}&base={base_url}"),
+    );
+    let album_with_songs = authed
+        .state
+        .metadata_cache
+        .get_or_build(&key, TTL_CATALOG, || async {
+            let album = client.get_album_detail(album_id).await?;
+            let tracks = client
+                .get_album_tracks(album_id, 0, 200)
+                .await
+                .map(|t| t.items)
+                .unwrap_or_default();
+            Ok(mapping::album_detail_to_album_with_songs(
+                &album, &tracks, &base_url,
+            ))
+        })
         .await
         .map_err(ApiError::Tidal)?;
-    let payload = match client.get_album_tracks(album_id, 0, 200).await {
-        Ok(tracks) => Payload::Album(mapping::album_detail_to_album_with_songs(
-            &album,
-            &tracks.items,
-            &base_url,
-        )),
-        // Still return album without tracks
-        Err(_e) => Payload::Album(mapping::album_detail_to_album_with_songs(
-            &album, &[], &base_url,
-        )),
-    };
-    Ok(payload.into())
+    Ok(Payload::Album(album_with_songs).into())
 }
 
 /// Classic browsing endpoint used by older clients (e.g. Submariner). An
