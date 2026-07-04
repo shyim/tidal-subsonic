@@ -236,7 +236,7 @@ Configure your Subsonic client with:
 
 ## Docker
 
-A multi-stage `Dockerfile` is included (the builder installs the C compiler; the runtime is `debian:stable-slim`).
+A multi-stage `Dockerfile` is included: a Node stage builds the web portal, an Alpine/musl stage produces a fully static binary, and the runtime is Google's **`distroless/static`** — no shell, no libc, no package manager. The result is a **~16 MB** image with minimal attack surface. TLS to TIDAL works with no CA certificates in the image, because rustls verifies against webpki roots compiled into the binary.
 
 ```sh
 docker build -t tidal-subsonic .

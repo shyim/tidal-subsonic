@@ -15,22 +15,20 @@ COPY web/ ./
 RUN node node_modules/vite/bin/vite.js build
 
 # ---- Builder ----------------------------------------------------------------
-# rust:1-slim + build-essential gives us the C compiler that the bundled SQLite
-# and the LAME MP3 encoder (mp3lame-encoder builds LAME via `cc`) need.
-FROM rust:1-slim AS builder
+# Static musl build so the binary can run on distroless/static (no libc). Alpine
+# ships a native musl C toolchain, which the bundled SQLite and the LAME MP3
+# encoder (mp3lame-encoder builds LAME via `cc`) compile against cleanly.
+# reqwest uses rustls with bundled webpki roots, so there's no OpenSSL to link
+# and no system CA store to ship.
+FROM rust:alpine AS builder
 
-# build-essential + the C toolchain for SQLite/LAME; libssl-dev + perl for the
-# openssl-sys crate (reqwest's native-tls backend links system OpenSSL).
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        build-essential pkg-config libssl-dev perl \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache musl-dev gcc make
 
 WORKDIR /app
 
-# Copy the manifests first so dependency compilation is cached separately from
-# the source, then copy the source. The prebuilt SPA comes from the web stage;
-# TIDAL_SUBSONIC_SKIP_WEB_BUILD tells build.rs to use it instead of re-building.
+# Copy the manifests first so dependency compilation caches separately from the
+# source. The prebuilt SPA comes from the web stage; TIDAL_SUBSONIC_SKIP_WEB_BUILD
+# tells build.rs to use it rather than re-running the frontend build.
 COPY Cargo.toml Cargo.lock* build.rs ./
 COPY src ./src
 COPY --from=web /web/dist ./web/dist
@@ -40,14 +38,10 @@ ENV TIDAL_SUBSONIC_SKIP_WEB_BUILD=1
 RUN cargo build --release
 
 # ---- Runtime ----------------------------------------------------------------
-# debian:stable-slim ships a glibc compatible with the dynamically-linked
-# binary produced above.
-FROM debian:stable-slim AS runtime
-
-# CA certificates + the OpenSSL runtime library the binary links against.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
-    && rm -rf /var/lib/apt/lists/*
+# distroless/static: no shell, no package manager, no libc — just the static
+# binary. Tiny (~16MB total) and minimal attack surface. CA certificates aren't
+# needed: rustls verifies TIDAL's TLS against webpki roots baked into the binary.
+FROM gcr.io/distroless/static-debian12 AS runtime
 
 COPY --from=builder /app/target/release/tidal-subsonic /usr/local/bin/tidal-subsonic
 
@@ -64,7 +58,6 @@ ENV XDG_CONFIG_HOME=/config \
 #   -e TIDAL_SUBSONIC_KEY="$(head -c 32 /dev/urandom | base64)"
 #   -e TIDAL_SUBSONIC_ADMIN_PASSWORD="..."   (else printed to the log once)
 
-RUN mkdir -p /config /cache
 VOLUME ["/config", "/cache"]
 
 EXPOSE 4533
