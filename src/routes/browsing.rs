@@ -10,10 +10,10 @@ pub(crate) async fn handle_get_indexes(authed: Authed) -> ApiResult {
     let client = authed.tidal().await?;
     let user_id = authed.tidal_user_id().await?;
     let artists = client
-        .get_favorite_artists(user_id, 0, 500)
+        .get_all_favorite_artists(user_id)
         .await
         .map_err(ApiError::Tidal)?;
-    Ok(Payload::Indexes(mapping::build_indexes(&artists.items)).into())
+    Ok(Payload::Indexes(mapping::build_indexes(&artists)).into())
 }
 
 pub(crate) async fn handle_get_artists(authed: Authed) -> ApiResult {
@@ -24,8 +24,8 @@ pub(crate) async fn handle_get_artists(authed: Authed) -> ApiResult {
         .state
         .metadata_cache
         .get_or_build(&key, TTL_FAVORITES, || async {
-            let artists = client.get_favorite_artists(user_id, 0, 500).await?;
-            let indexes = mapping::build_indexes(&artists.items);
+            let artists = client.get_all_favorite_artists(user_id).await?;
+            let indexes = mapping::build_indexes(&artists);
             Ok(ArtistsList {
                 ignored_articles: indexes.ignored_articles,
                 index: indexes.index,
@@ -56,8 +56,8 @@ pub(crate) async fn handle_get_artist(authed: Authed) -> ApiResult {
             let artist_detail = client.get_artist_detail(artist_id).await?;
             let sub_artist = mapping::artist_to_subsonic(&artist_detail);
             let mut sub_albums = Vec::new();
-            if let Ok(albums) = client.get_artist_albums(artist_id, 0, 100).await {
-                sub_albums = albums.items.iter().map(mapping::album_to_subsonic).collect();
+            if let Ok(albums) = client.get_all_artist_albums(artist_id).await {
+                sub_albums = albums.iter().map(mapping::album_to_subsonic).collect();
             }
             Ok(ArtistWithAlbums {
                 id: sub_artist.id,
@@ -100,9 +100,8 @@ pub(crate) async fn handle_get_album(authed: Authed, headers: HeaderMap) -> ApiR
         .get_or_build(&key, TTL_CATALOG, || async {
             let album = client.get_album_detail(album_id).await?;
             let tracks = client
-                .get_album_tracks(album_id, 0, 200)
+                .get_all_album_tracks(album_id)
                 .await
-                .map(|t| t.items)
                 .unwrap_or_default();
             Ok(mapping::album_detail_to_album_with_songs(
                 &album, &tracks, &base_url,
@@ -133,9 +132,8 @@ pub(crate) async fn handle_get_music_directory(authed: Authed, headers: HeaderMa
                 .await
                 .map_err(ApiError::Tidal)?;
             let mut children = Vec::new();
-            if let Ok(albums) = client.get_artist_albums(artist_id, 0, 100).await {
+            if let Ok(albums) = client.get_all_artist_albums(artist_id).await {
                 children = albums
-                    .items
                     .iter()
                     .map(|a| mapping::album_to_directory_child(a, &dir_id))
                     .collect();
@@ -155,9 +153,8 @@ pub(crate) async fn handle_get_music_directory(authed: Authed, headers: HeaderMa
                 .await
                 .map_err(ApiError::Tidal)?;
             let tracks = client
-                .get_album_tracks(album_id, 0, 200)
+                .get_all_album_tracks(album_id)
                 .await
-                .map(|t| t.items)
                 .unwrap_or_default();
             let children = tracks
                 .iter()

@@ -184,18 +184,22 @@ pub struct TidalPlaylistCreator {
     pub name: Option<String>,
 }
 
-/// A page of results. Only `items` is used; TIDAL's `totalNumberOfItems`,
-/// `offset`, and `limit` are ignored (the proxy paginates client-side).
+/// A page of results plus the total count TIDAL reports (used to drive
+/// fetch-all paging loops and to report totals to Subsonic clients).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaginatedResponse<T> {
     pub items: Vec<T>,
+    #[serde(default)]
+    pub total_number_of_items: u32,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaginatedTracks {
     pub items: Vec<TidalTrack>,
+    #[serde(default)]
+    pub total_number_of_items: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

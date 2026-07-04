@@ -112,20 +112,16 @@ pub(crate) async fn handle_get_starred(authed: Authed, headers: HeaderMap) -> Ap
         song: None,
     };
 
-    if let Ok(tracks) = client.get_favorite_tracks(user_id, 0, 100).await {
+    if let Ok(tracks) = client.get_all_favorite_tracks(user_id).await {
         starred.song = Some(
-            tracks.items.iter().map(|t| mapping::track_to_child(t, &base_url)).collect()
+            tracks.iter().map(|t| mapping::track_to_child(t, &base_url)).collect()
         );
     }
-    if let Ok(albums) = client.get_favorite_albums(user_id, 0, 100).await {
-        starred.album = Some(
-            albums.items.iter().map(mapping::album_to_subsonic).collect()
-        );
+    if let Ok(albums) = client.get_all_favorite_albums(user_id).await {
+        starred.album = Some(albums.iter().map(mapping::album_to_subsonic).collect());
     }
-    if let Ok(artists) = client.get_favorite_artists(user_id, 0, 100).await {
-        starred.artist = Some(
-            artists.items.iter().map(mapping::artist_to_subsonic).collect()
-        );
+    if let Ok(artists) = client.get_all_favorite_artists(user_id).await {
+        starred.artist = Some(artists.iter().map(mapping::artist_to_subsonic).collect());
     }
 
     // Also populate starred2 for v2 clients, mirroring the same items.

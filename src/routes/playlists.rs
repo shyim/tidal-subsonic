@@ -15,9 +15,8 @@ pub(crate) async fn handle_get_playlists(authed: Authed) -> ApiResult {
         .state
         .metadata_cache
         .get_or_build(&key, TTL_FAVORITES, || async {
-            let playlists = client.get_user_playlists(user_id, 0, 200).await?;
+            let playlists = client.get_all_user_playlists(user_id).await?;
             let sub_playlists: Vec<SubsonicPlaylist> = playlists
-                .items
                 .iter()
                 .map(mapping::playlist_to_subsonic)
                 .collect();
@@ -40,11 +39,10 @@ async fn build_playlist_response(
 ) -> Result<PlaylistWithSongs, ApiError> {
     let meta = client.get_playlist(playlist_uuid).await.ok();
     let tracks = client
-        .get_playlist_tracks(playlist_uuid, 0, 500)
+        .get_all_playlist_tracks(playlist_uuid)
         .await
         .map_err(ApiError::Tidal)?;
     let songs: Vec<SubsonicChild> = tracks
-        .items
         .iter()
         .map(|t| mapping::track_to_child(t, base_url))
         .collect();

@@ -6,7 +6,115 @@ use super::super::types::*;
 use super::super::TidalClient;
 use serde::Deserialize;
 
+/// Page size for fetch-all loops. TIDAL accepts larger limits, but 100 keeps
+/// each request modest while still finishing large lists in a few round-trips.
+const PAGE: u32 = 100;
+/// Safety cap so a misbehaving total can't loop forever (100 pages = 10k items).
+const MAX_PAGES: u32 = 100;
+
 impl TidalClient {
+    /// Fetch every page of a paginated list into one Vec, using
+    /// `total_number_of_items` to know when to stop.
+    pub async fn get_all_favorite_tracks(&self, user_id: u64) -> Result<Vec<TidalTrack>, String> {
+        let mut out = Vec::new();
+        for page in 0..MAX_PAGES {
+            let p = self.get_favorite_tracks(user_id, page * PAGE, PAGE).await?;
+            let got = p.items.len() as u32;
+            out.extend(p.items);
+            if got < PAGE || out.len() as u32 >= p.total_number_of_items {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn get_all_favorite_albums(
+        &self,
+        user_id: u64,
+    ) -> Result<Vec<TidalAlbumDetail>, String> {
+        let mut out = Vec::new();
+        for page in 0..MAX_PAGES {
+            let p = self.get_favorite_albums(user_id, page * PAGE, PAGE).await?;
+            let got = p.items.len() as u32;
+            out.extend(p.items);
+            if got < PAGE || out.len() as u32 >= p.total_number_of_items {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn get_all_favorite_artists(
+        &self,
+        user_id: u64,
+    ) -> Result<Vec<TidalArtistDetail>, String> {
+        let mut out = Vec::new();
+        for page in 0..MAX_PAGES {
+            let p = self.get_favorite_artists(user_id, page * PAGE, PAGE).await?;
+            let got = p.items.len() as u32;
+            out.extend(p.items);
+            if got < PAGE || out.len() as u32 >= p.total_number_of_items {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn get_all_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<TidalTrack>, String> {
+        let mut out = Vec::new();
+        for page in 0..MAX_PAGES {
+            let p = self.get_playlist_tracks(playlist_id, page * PAGE, PAGE).await?;
+            let got = p.items.len() as u32;
+            out.extend(p.items);
+            if got < PAGE || out.len() as u32 >= p.total_number_of_items {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn get_all_album_tracks(&self, album_id: u64) -> Result<Vec<TidalTrack>, String> {
+        let mut out = Vec::new();
+        for page in 0..MAX_PAGES {
+            let p = self.get_album_tracks(album_id, page * PAGE, PAGE).await?;
+            let got = p.items.len() as u32;
+            out.extend(p.items);
+            if got < PAGE || out.len() as u32 >= p.total_number_of_items {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn get_all_user_playlists(&self, user_id: u64) -> Result<Vec<TidalPlaylist>, String> {
+        let mut out = Vec::new();
+        for page in 0..MAX_PAGES {
+            let p = self.get_user_playlists(user_id, page * PAGE, PAGE).await?;
+            let got = p.items.len() as u32;
+            out.extend(p.items);
+            if got < PAGE || out.len() as u32 >= p.total_number_of_items {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn get_all_artist_albums(
+        &self,
+        artist_id: u64,
+    ) -> Result<Vec<TidalAlbumDetail>, String> {
+        let mut out = Vec::new();
+        for page in 0..MAX_PAGES {
+            let p = self.get_artist_albums(artist_id, page * PAGE, PAGE).await?;
+            let got = p.items.len() as u32;
+            out.extend(p.items);
+            if got < PAGE || out.len() as u32 >= p.total_number_of_items {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn get_user_playlists(
         &self,
         user_id: u64,
@@ -33,6 +141,7 @@ impl TidalClient {
         let data: Resp = serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
         Ok(PaginatedResponse {
             items: data.items,
+            total_number_of_items: data.total_number_of_items,
         })
     }
 
@@ -63,15 +172,12 @@ impl TidalClient {
         struct Resp {
             items: Vec<TidalTrack>,
             total_number_of_items: u32,
-            #[serde(default)]
-            offset: u32,
-            #[serde(default)]
-            limit: u32,
         }
 
         let data: Resp = serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
         Ok(PaginatedTracks {
             items: data.items,
+            total_number_of_items: data.total_number_of_items,
         })
     }
 
@@ -102,15 +208,13 @@ impl TidalClient {
         struct FavResponse {
             items: Vec<FavItem>,
             total_number_of_items: u32,
-            #[serde(default)]
-            offset: u32,
-            #[serde(default)]
-            limit: u32,
         }
 
         let data: FavResponse = serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
+        let total = data.total_number_of_items;
         Ok(PaginatedTracks {
             items: data.items.into_iter().map(|f| f.item).collect(),
+            total_number_of_items: total,
         })
     }
 
@@ -144,8 +248,10 @@ impl TidalClient {
         }
 
         let data: FavResponse = serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
+        let total = data.total_number_of_items;
         Ok(PaginatedResponse {
             items: data.items.into_iter().map(|f| f.item).collect(),
+            total_number_of_items: total,
         })
     }
 
@@ -179,8 +285,10 @@ impl TidalClient {
         }
 
         let data: FavResponse = serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
+        let total = data.total_number_of_items;
         Ok(PaginatedResponse {
             items: data.items.into_iter().map(|f| f.item).collect(),
+            total_number_of_items: total,
         })
     }
 
@@ -287,15 +395,12 @@ impl TidalClient {
         struct Resp {
             items: Vec<TidalTrack>,
             total_number_of_items: u32,
-            #[serde(default)]
-            offset: u32,
-            #[serde(default)]
-            limit: u32,
         }
 
         let data: Resp = serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
         Ok(PaginatedTracks {
             items: data.items,
+            total_number_of_items: data.total_number_of_items,
         })
     }
 
@@ -333,6 +438,7 @@ impl TidalClient {
         let data: Resp = serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
         Ok(PaginatedResponse {
             items: data.items,
+            total_number_of_items: data.total_number_of_items,
         })
     }
 
@@ -387,6 +493,7 @@ impl TidalClient {
         let data: Resp = serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
         Ok(PaginatedTracks {
             items: data.items,
+            total_number_of_items: data.total_number_of_items,
         })
     }
 
