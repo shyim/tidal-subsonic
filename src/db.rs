@@ -269,9 +269,9 @@ pub async fn migrate_single_user(db: &SharedDb, cipher: &Cipher) -> Result<()> {
 fn random_password() -> String {
     use rand::Rng;
     const CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..20)
-        .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+        .map(|_| CHARS[rng.random_range(0..CHARS.len())] as char)
         .collect()
 }
 

@@ -10,12 +10,10 @@
 //! before handing the bytes here.
 
 use std::io::Cursor;
-use symphonia::core::audio::{AudioBufferRef, Signal};
-use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::codecs::CodecParameters;
+use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 
 /// Decoded PCM ready for MP3 encoding.
 struct Pcm {
@@ -32,53 +30,52 @@ fn decode_aac_mp4(data: Vec<u8>) -> Result<Pcm, String> {
     hint.with_extension("m4a");
     hint.mime_type("audio/mp4");
 
-    let probed = symphonia::default::get_probe()
-        .format(
+    let mut format = symphonia::default::get_probe()
+        .probe(
             &hint,
             mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
+            FormatOptions::default(),
+            symphonia::core::meta::MetadataOptions::default(),
         )
         .map_err(|e| format!("probe failed: {}", e))?;
-    let mut format = probed.format;
 
+    // Pick the default audio track and pull out its audio codec params.
     let track = format
-        .default_track()
-        .ok_or_else(|| "no default track".to_string())?
-        .clone();
+        .default_track(symphonia::core::formats::TrackType::Audio)
+        .ok_or_else(|| "no default audio track".to_string())?;
     let track_id = track.id;
+    let audio_params = match track.codec_params.as_ref() {
+        Some(CodecParameters::Audio(p)) => p.clone(),
+        _ => return Err("track has no audio codec params".to_string()),
+    };
 
     let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
+        .make_audio_decoder(&audio_params, &Default::default())
         .map_err(|e| format!("decoder init failed: {}", e))?;
 
-    let mut sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
-    let mut channels = track
-        .codec_params
-        .channels
-        .map(|c| c.count())
-        .unwrap_or(2);
+    let mut sample_rate = audio_params.sample_rate.unwrap_or(44100);
+    let mut channels = audio_params.channels.as_ref().map(|c| c.count()).unwrap_or(2);
     let mut interleaved: Vec<i16> = Vec::new();
+    // Per-packet scratch: copy_to_vec_interleaved *resizes* its target to the
+    // current buffer, so we decode into `frame` then extend the accumulator.
+    let mut frame: Vec<i16> = Vec::new();
 
-    loop {
-        let packet = match format.next_packet() {
-            Ok(p) => p,
-            // Clean end of stream.
-            Err(symphonia::core::errors::Error::IoError(e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
-                break;
-            }
-            Err(e) => return Err(format!("read packet: {}", e)),
-        };
-        if packet.track_id() != track_id {
+    // 0.6: next_packet() returns Ok(None) at clean end of stream.
+    while let Some(packet) = format
+        .next_packet()
+        .map_err(|e| format!("read packet: {}", e))?
+    {
+        if packet.track_id != track_id {
             continue;
         }
         match decoder.decode(&packet) {
             Ok(decoded) => {
-                sample_rate = decoded.spec().rate;
-                channels = decoded.spec().channels.count();
-                append_interleaved(&decoded, &mut interleaved);
+                sample_rate = decoded.spec().rate();
+                channels = decoded.spec().channels().count();
+                // Convert whatever sample format the decoder produced into
+                // interleaved i16, then append to the running output.
+                decoded.copy_to_vec_interleaved(&mut frame);
+                interleaved.extend_from_slice(&frame);
             }
             // Decoder resync errors are recoverable — skip the packet.
             Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
@@ -95,48 +92,6 @@ fn decode_aac_mp4(data: Vec<u8>) -> Result<Pcm, String> {
         channels,
         interleaved,
     })
-}
-
-/// Append a decoded audio buffer to the interleaved i16 output, converting from
-/// whatever sample format symphonia produced.
-fn append_interleaved(decoded: &AudioBufferRef, out: &mut Vec<i16>) {
-    macro_rules! interleave {
-        ($buf:expr, $conv:expr) => {{
-            let buf = $buf;
-            let ch = buf.spec().channels.count();
-            let frames = buf.frames();
-            out.reserve(frames * ch);
-            for f in 0..frames {
-                for c in 0..ch {
-                    out.push($conv(buf.chan(c)[f]));
-                }
-            }
-        }};
-    }
-    match decoded {
-        AudioBufferRef::S16(b) => interleave!(b.as_ref(), |s: i16| s),
-        AudioBufferRef::S32(b) => interleave!(b.as_ref(), |s: i32| (s >> 16) as i16),
-        AudioBufferRef::F32(b) => interleave!(b.as_ref(), |s: f32| {
-            (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
-        }),
-        AudioBufferRef::F64(b) => interleave!(b.as_ref(), |s: f64| {
-            (s.clamp(-1.0, 1.0) * i16::MAX as f64) as i16
-        }),
-        AudioBufferRef::S24(b) => interleave!(b.as_ref(), |s: symphonia::core::sample::i24| {
-            (s.inner() >> 8) as i16
-        }),
-        AudioBufferRef::U8(b) => {
-            interleave!(b.as_ref(), |s: u8| (s as i16 - 128) << 8)
-        }
-        AudioBufferRef::U16(b) => interleave!(b.as_ref(), |s: u16| (s as i32 - 32768) as i16),
-        AudioBufferRef::U24(b) => interleave!(b.as_ref(), |s: symphonia::core::sample::u24| {
-            ((s.inner() as i32 >> 8) - 32768) as i16
-        }),
-        AudioBufferRef::U32(b) => {
-            interleave!(b.as_ref(), |s: u32| ((s >> 16) as i32 - 32768) as i16)
-        }
-        AudioBufferRef::S8(b) => interleave!(b.as_ref(), |s: i8| (s as i16) << 8),
-    }
 }
 
 /// Encode interleaved i16 PCM to MP3 at the target bitrate (kbps).

@@ -9,13 +9,13 @@ readme = "README.md"
 
 [dependencies]
 # Web framework
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 
 # HTTP client for Tidal API. rustls (not native-tls) so we don't link system
 # OpenSSL — simpler, more portable builds and a slimmer runtime image.
-reqwest = { version = "0.11", default-features = false, features = [
+reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "stream",
     "rustls-tls",
@@ -24,20 +24,20 @@ reqwest = { version = "0.11", default-features = false, features = [
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-quick-xml = { version = "0.36", features = ["serialize"] }
+quick-xml = { version = "0.41", features = ["serialize"] }
 
 # Auth
-md5 = "0.7"
-sha2 = "0.10"
-base64 = "0.21"
-rand = "0.8"
+md5 = "0.8"
+sha2 = "0.11"
+base64 = "0.22"
+rand = "0.9"
 
 # Encrypt TIDAL tokens at rest (multi-user: one DB holds every user's session)
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 
 # Config
-toml = "0.8"
-dirs = "5"
+toml = "1.1"
+dirs = "6"
 
 # Logging
 tracing = "0.1"
@@ -48,20 +48,20 @@ url = "2"
 serde_urlencoded = "0.7"
 
 # XML parsing for DASH manifests
-roxmltree = "0.20"
+roxmltree = "0.21"
 
 # Database
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Error handling
 anyhow = "1"
 
 # Audio transcoding (AAC-LC in fMP4 -> MP3) for clients that require MP3,
 # e.g. the Garmin YuMusic app which declares Media.ENCODING_MP3.
-symphonia = { version = "0.5", default-features = false, features = ["aac", "isomp4"] }
+symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4"] }
 mp3lame-encoder = "0.2"
 
 [dev-dependencies]
 # Drive the axum Router in-process for integration tests (no TCP bind).
-tower = { version = "0.4", features = ["util"] }
+tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

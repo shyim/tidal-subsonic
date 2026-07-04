@@ -38,8 +38,8 @@ pub async fn start_link(state: &AppState, subsonic_user_id: i64) -> LinkStart {
 
     // Generate PKCE parameters (scoped so rng drops before any await).
     let (code_verifier, code_challenge, client_unique_key) = {
-        let mut rng = rand::thread_rng();
-        let random_bytes: [u8; 32] = rng.gen();
+        let mut rng = rand::rng();
+        let random_bytes: [u8; 32] = rng.random();
         let code_verifier =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random_bytes);
         let mut hasher = Sha256::new();
@@ -47,7 +47,7 @@ pub async fn start_link(state: &AppState, subsonic_user_id: i64) -> LinkStart {
         let code_challenge =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize());
         // 128-bit unguessable key tying the eventual code back to this session.
-        let key_bytes: [u8; 16] = rng.gen();
+        let key_bytes: [u8; 16] = rng.random();
         let client_unique_key: String =
             key_bytes.iter().map(|b| format!("{:02x}", b)).collect();
         (code_verifier, code_challenge, client_unique_key)

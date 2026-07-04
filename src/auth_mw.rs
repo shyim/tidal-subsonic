@@ -121,7 +121,6 @@ impl Authed {
     }
 }
 
-#[axum::async_trait]
 impl FromRequestParts<AppState> for Authed {
     type Rejection = ApiError;
 

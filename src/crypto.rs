@@ -11,7 +11,7 @@
 use base64::Engine;
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
-    ChaCha20Poly1305, Key, Nonce,
+    ChaCha20Poly1305, Nonce,
 };
 use rand::RngCore;
 
@@ -31,7 +31,7 @@ impl Cipher {
     /// Generate a fresh random 32-byte key.
     pub fn generate_key() -> [u8; 32] {
         let mut key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut key);
         key
     }
 
@@ -51,11 +51,11 @@ impl Cipher {
         if plaintext.is_empty() {
             return String::new();
         }
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
+        let cipher = ChaCha20Poly1305::new((&self.key).into());
         let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
-        match cipher.encrypt(nonce, plaintext.as_bytes()) {
+        rand::rng().fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from(nonce_bytes);
+        match cipher.encrypt(&nonce, plaintext.as_bytes()) {
             Ok(ct) => {
                 let mut out = Vec::with_capacity(12 + ct.len());
                 out.extend_from_slice(&nonce_bytes);
@@ -81,10 +81,11 @@ impl Cipher {
             return String::new();
         }
         let (nonce_bytes, ct) = raw.split_at(12);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let cipher = ChaCha20Poly1305::new((&self.key).into());
+        let nonce_arr: [u8; 12] = nonce_bytes.try_into().expect("checked len >= 12");
+        let nonce = Nonce::from(nonce_arr);
         cipher
-            .decrypt(nonce, ct)
+            .decrypt(&nonce, ct)
             .ok()
             .and_then(|pt| String::from_utf8(pt).ok())
             .unwrap_or_default()
