@@ -171,10 +171,11 @@ struct LinkCompleteBody {
 
 async fn link_complete(
     State(state): State<AppState>,
-    Session(_s): Session,
+    Session(s): Session,
     Json(body): Json<LinkCompleteBody>,
 ) -> Response {
-    match auth::complete_link(&state, &body.code, &body.key).await {
+    // Bind completion to the logged-in user — you can only finish your own link.
+    match auth::complete_link(&state, &body.code, &body.key, s.user_id).await {
         Ok(_) => Json(json!({ "tidalLinked": true })).into_response(),
         Err(e) => json_err(StatusCode::BAD_REQUEST, &e),
     }
@@ -235,6 +236,17 @@ fn require_admin(s: &WebSession) -> Result<(), Response> {
     } else {
         Err(json_err(StatusCode::FORBIDDEN, "Admin only"))
     }
+}
+
+/// Drop all portal sessions belonging to `username`, so a password change,
+/// privilege change, or deletion takes effect immediately (existing sessions
+/// carry a cached `is_admin`, so they must be re-established).
+async fn invalidate_user_sessions(state: &AppState, username: &str) {
+    state
+        .web_sessions
+        .lock()
+        .await
+        .retain(|_, sess| sess.username != username);
 }
 
 async fn list_users(State(state): State<AppState>, Session(s): Session) -> Response {
@@ -315,7 +327,12 @@ async fn update_user(
     }
     let pw = body.password.as_deref().filter(|p| !p.is_empty());
     match db::update_user(&state.db, &state.cipher, &name, pw, body.is_admin).await {
-        Some(_) => Json(json!({ "ok": true })).into_response(),
+        Some(_) => {
+            // A password or privilege change must not leave stale sessions with
+            // the old credentials/role active.
+            invalidate_user_sessions(&state, &name).await;
+            Json(json!({ "ok": true })).into_response()
+        }
         None => json_err(StatusCode::NOT_FOUND, "User not found"),
     }
 }
@@ -334,6 +351,7 @@ async fn delete_user(
     match db::delete_user(&state.db, &name).await {
         Some(id) => {
             state.registry.invalidate(id).await;
+            invalidate_user_sessions(&state, &name).await;
             Json(json!({ "ok": true })).into_response()
         }
         None => json_err(StatusCode::NOT_FOUND, "User not found"),

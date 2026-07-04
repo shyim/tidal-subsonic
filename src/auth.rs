@@ -46,7 +46,10 @@ pub async fn start_link(state: &AppState, subsonic_user_id: i64) -> LinkStart {
         hasher.update(code_verifier.as_bytes());
         let code_challenge =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize());
-        let client_unique_key = format!("{:016x}", rng.gen::<u64>());
+        // 128-bit unguessable key tying the eventual code back to this session.
+        let key_bytes: [u8; 16] = rng.gen();
+        let client_unique_key: String =
+            key_bytes.iter().map(|b| format!("{:02x}", b)).collect();
         (code_verifier, code_challenge, client_unique_key)
     };
 
@@ -80,11 +83,14 @@ pub async fn start_link(state: &AppState, subsonic_user_id: i64) -> LinkStart {
 
 /// Complete a TIDAL link: given the pasted `code` (or full redirect URL) and the
 /// `client_unique_key`, exchange for tokens and store them against the pending
-/// session's user. Returns the linked TIDAL user id on success.
+/// session's user. `expected_user_id` is the logged-in portal user; the link is
+/// refused unless it matches the user who started this PKCE flow — so nobody can
+/// complete (or hijack) someone else's pending link. Returns the TIDAL user id.
 pub async fn complete_link(
     state: &AppState,
     code_or_url: &str,
     client_unique_key: &str,
+    expected_user_id: i64,
 ) -> Result<u64, String> {
     let client_unique_key = client_unique_key.trim();
     if code_or_url.trim().is_empty() || client_unique_key.is_empty() {
@@ -99,6 +105,11 @@ pub async fn complete_link(
         sessions.get(client_unique_key).cloned()
     }
     .ok_or_else(|| "Link session expired — start again".to_string())?;
+
+    // The user completing the link must be the one who started it.
+    if session.subsonic_user_id != expected_user_id {
+        return Err("This link session belongs to a different account".into());
+    }
 
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
