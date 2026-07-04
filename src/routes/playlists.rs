@@ -20,10 +20,15 @@ pub(crate) async fn handle_get_playlists(authed: Authed) -> ApiResult {
                 .iter()
                 .map(mapping::playlist_to_subsonic)
                 .collect();
-            // Append TIDAL's generated mixes (Daily Mix, My Mix, …) as playlists.
-            // Best-effort: if the mixes endpoint fails, still return the real ones.
-            if let Ok(mixes) = client.get_my_mixes().await {
-                sub_playlists.extend(mixes.iter().map(mapping::mix_to_subsonic_playlist));
+            // Append TIDAL's generated mixes (Daily Mix, My Mix, …) as playlists,
+            // each with its real track count (fetched concurrently). Best-effort:
+            // if the mixes endpoint fails, still return the real playlists.
+            if let Ok(mixes) = client.get_my_mixes_with_counts().await {
+                sub_playlists.extend(
+                    mixes
+                        .iter()
+                        .map(|(m, count)| mapping::mix_to_subsonic_playlist(m, *count)),
+                );
             }
             Ok(PlaylistsWrapper {
                 playlist: sub_playlists,

@@ -36,6 +36,36 @@ impl TidalClient {
         Ok(mixes)
     }
 
+    /// The user's mixes, each paired with its track count. The mix list itself
+    /// carries no count, so we fetch each mix's tracks — but concurrently, so the
+    /// added latency is roughly one fetch, not N. `self` must be `Arc` (the
+    /// registry always hands out `SharedTidalClient`) so the tasks can share it.
+    pub async fn get_my_mixes_with_counts(
+        self: &std::sync::Arc<Self>,
+    ) -> Result<Vec<(TidalMix, u32)>, String> {
+        let mixes = self.get_my_mixes().await?;
+        let mut set = tokio::task::JoinSet::new();
+        for (idx, mix) in mixes.iter().enumerate() {
+            let client = self.clone();
+            let id = mix.id.clone();
+            set.spawn(async move {
+                let count = client
+                    .get_mix_tracks(&id)
+                    .await
+                    .map(|d| d.tracks.len() as u32)
+                    .unwrap_or(0);
+                (idx, count)
+            });
+        }
+        let mut counts = vec![0u32; mixes.len()];
+        while let Some(res) = set.join_next().await {
+            if let Ok((idx, count)) = res {
+                counts[idx] = count;
+            }
+        }
+        Ok(mixes.into_iter().zip(counts).collect())
+    }
+
     /// A mix's title + tracks, from `pages/mix?mixId=…` (falls back to the legacy
     /// `mixes/{id}/items` endpoint, which has no title, if the page has no
     /// TRACK_LIST).

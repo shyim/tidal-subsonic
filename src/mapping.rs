@@ -329,16 +329,16 @@ pub fn playlist_to_subsonic(playlist: &TidalPlaylist) -> SubsonicPlaylist {
     }
 }
 
-/// Map a TIDAL generated mix to a Subsonic playlist entry. Track count/duration
-/// aren't in the mix list (they need a separate fetch), so they're left unset.
-pub fn mix_to_subsonic_playlist(mix: &crate::tidal::TidalMix) -> SubsonicPlaylist {
+/// Map a TIDAL generated mix to a Subsonic playlist entry. `song_count` is
+/// fetched separately (the mix list carries no count); duration stays unset.
+pub fn mix_to_subsonic_playlist(mix: &crate::tidal::TidalMix, song_count: u32) -> SubsonicPlaylist {
     SubsonicPlaylist {
         id: ItemId::Mix(mix.id.clone()).to_string(),
         name: mix.title.clone().unwrap_or_else(|| "Mix".to_string()),
         comment: mix.sub_title.clone(),
         owner: Some("TIDAL".to_string()),
         public: Some(false),
-        song_count: None,
+        song_count: Some(song_count),
         duration: None,
         created: None,
         changed: None,
