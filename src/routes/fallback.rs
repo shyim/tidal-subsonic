@@ -14,12 +14,15 @@ pub(crate) async fn handle_not_implemented(
 ) -> Response {
     let path = request.uri().path().to_string();
 
-    // Only Subsonic REST calls (/rest/*) should get a Subsonic-shaped response.
-    // Anything else (e.g. a client probing a server-native endpoint like
-    // /auth/login) must 404 so the client knows it's absent and falls back,
-    // rather than seeing a 200 and assuming the endpoint exists.
-    if !path.starts_with("/rest/") {
+    // An unknown /api route is a portal API miss → 404 JSON-ish, not the SPA.
+    if path.starts_with("/api/") {
         return (StatusCode::NOT_FOUND, "Not found").into_response();
+    }
+
+    // Non-/rest, non-/api routes serve the embedded SPA (its client-side router
+    // handles the actual path). `/rest/*` falls through to the Subsonic handling.
+    if !path.starts_with("/rest/") {
+        return crate::routes::spa::serve_spa().await;
     }
 
     let query_str = request.uri().query().unwrap_or("");

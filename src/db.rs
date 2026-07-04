@@ -527,6 +527,16 @@ pub async fn delete_bookmark(db: &SharedDb, user_id: i64, track_id: &str) -> Res
     Ok(())
 }
 
+/// Remove a user's TIDAL link (unlink).
+pub async fn delete_tidal_account(db: &SharedDb, user_id: i64) -> Result<()> {
+    let conn = db.lock().await;
+    conn.execute(
+        "DELETE FROM tidal_accounts WHERE user_id = ?1",
+        params![user_id],
+    )?;
+    Ok(())
+}
+
 /// Insert or update a user's TIDAL tokens (encrypted at rest).
 pub async fn save_tidal_account(
     db: &SharedDb,

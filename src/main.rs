@@ -84,9 +84,12 @@ async fn main() {
         max_quality: max_quality.clone(),
         media_cache: routes::media_cache::MediaCache::open(),
         metadata_cache: routes::metadata_cache::MetadataCache::new(),
+        web_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     };
 
-    let mut app = auth::auth_routes();
+    // Web portal: the /api/* JSON surface. The embedded SPA is served by the
+    // final fallback for any non-/api, non-/rest route.
+    let mut app = routes::portal::api_routes();
     // Each endpoint is registered under both `/rest/<name>` and its `.view`
     // alias via `rest`, so the list below stays one line per endpoint.
     for (name, handler) in [

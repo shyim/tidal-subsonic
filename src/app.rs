@@ -11,6 +11,16 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// A browser session for the web portal, keyed by a random cookie token.
+#[derive(Debug, Clone)]
+pub(crate) struct WebSession {
+    pub(crate) user_id: i64,
+    pub(crate) username: String,
+    pub(crate) is_admin: bool,
+}
+
+pub(crate) type WebSessions = Arc<tokio::sync::Mutex<HashMap<String, WebSession>>>;
+
 #[derive(Clone)]
 pub(crate) struct AppState {
     /// Per-user TIDAL clients — resolve one for the authenticated user.
@@ -23,6 +33,8 @@ pub(crate) struct AppState {
     pub(crate) media_cache: MediaCache,
     /// Per-user in-memory cache for browse/search/list responses.
     pub(crate) metadata_cache: MetadataCache,
+    /// Web-portal browser sessions (token → session).
+    pub(crate) web_sessions: WebSessions,
 }
 
 #[derive(Debug, Default, Deserialize)]
