@@ -40,6 +40,10 @@ pub struct TidalClient {
     // accessor for every call.
     pub(in crate::tidal) client: Client,
     pub(in crate::tidal) creds: Mutex<Creds>,
+    /// Serializes token refreshes: TIDAL rotates the refresh token on use, so N
+    /// concurrent requests must not all refresh at once (the winner's rotation
+    /// would invalidate the losers' refresh token). Held only around a refresh.
+    refresh_lock: Mutex<()>,
     client_id: String,
     client_secret: String,
     db: SharedDb,
@@ -73,6 +77,7 @@ impl TidalClient {
                 .build()
                 .unwrap(),
             creds: Mutex::new(creds),
+            refresh_lock: Mutex::new(()),
             client_id,
             client_secret,
             db,
@@ -158,6 +163,31 @@ impl TidalClient {
         Ok((tokens.access_token, tokens.refresh_token.unwrap_or(current_refresh)))
     }
 
+    /// Refresh the access token, single-flight. `stale_access` is the token the
+    /// caller saw fail (empty if it just found no token). Under the refresh lock
+    /// we re-check the current token: if it already changed, another task
+    /// refreshed while we waited, so we return without hitting TIDAL again — this
+    /// prevents a concurrent stampede of refreshes racing TIDAL's token rotation.
+    async fn refresh_tokens(&self, stale_access: &str) -> Result<(), String> {
+        let _guard = self.refresh_lock.lock().await;
+
+        // Someone else refreshed while we waited for the lock.
+        let current = self.creds.lock().await.access_token.clone();
+        if current != stale_access && !current.is_empty() {
+            return Ok(());
+        }
+
+        let (access, refresh) = self.refresh_token_request().await?;
+        {
+            let mut creds = self.creds.lock().await;
+            creds.access_token = access;
+            creds.refresh_token = refresh;
+        }
+        // TIDAL rotates the refresh token; persist so it survives a restart.
+        self.persist_creds().await;
+        Ok(())
+    }
+
     pub(super) async fn ensure_auth(&self) -> Result<(), String> {
         let (has_access, has_refresh) = {
             let creds = self.creds.lock().await;
@@ -167,15 +197,8 @@ impl TidalClient {
             return Ok(());
         }
         if has_refresh {
-            let (access, refresh) = self.refresh_token_request().await?;
-            {
-                let mut creds = self.creds.lock().await;
-                creds.access_token = access;
-                creds.refresh_token = refresh;
-            }
-            // TIDAL rotates the refresh token; persist so it survives a restart.
-            self.persist_creds().await;
-            return Ok(());
+            // No access token yet — refresh (single-flight; stale_access is "").
+            return self.refresh_tokens("").await;
         }
         Err("Not authenticated. Visit the web UI to log in with TIDAL.".into())
     }
@@ -204,17 +227,11 @@ impl TidalClient {
             }
         };
 
-        let response = make_request(token).await?;
+        let response = make_request(token.clone()).await?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            // Refresh and retry
-            let (access, refresh) = self.refresh_token_request().await?;
-            {
-                let mut creds = self.creds.lock().await;
-                creds.access_token = access;
-                creds.refresh_token = refresh;
-            }
-            // TIDAL rotates the refresh token; persist so it survives a restart.
-            self.persist_creds().await;
+            // Refresh (single-flight — pass the token that just failed so a
+            // concurrent refresh isn't repeated) and retry once.
+            self.refresh_tokens(&token).await?;
             let response = make_request(self.access_token().await).await?;
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
