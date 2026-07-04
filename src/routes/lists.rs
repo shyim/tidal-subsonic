@@ -3,12 +3,12 @@ use crate::auth_mw::{xml_ok, ApiError, ApiOk, ApiResult, Authed};
 use crate::item_id::ItemId;
 use crate::mapping;
 use crate::subsonic::*;
-use crate::tidal::TidalClient;
+use crate::tidal::SharedTidalClient;
 use axum::http::HeaderMap;
 
 pub(crate) async fn handle_get_random_songs(authed: Authed, headers: HeaderMap) -> ApiResult {
     let size = authed.params.size.unwrap_or(10).min(50);
-    let client = authed.tidal();
+    let client = authed.tidal().await?;
     let user_id = authed.tidal_user_id().await?;
     let tracks = client
         .get_favorite_tracks(user_id, 0, 200)
@@ -27,7 +27,7 @@ pub(crate) async fn handle_get_random_songs(authed: Authed, headers: HeaderMap) 
 /// Fetch and order the album list for the given `type`, backed by the user's
 /// TIDAL favorites (the only broad album source available via the proxy).
 async fn fetch_album_list(
-    client: &TidalClient,
+    client: &SharedTidalClient,
     list_type: &str,
     size: u32,
     offset: u32,
@@ -66,7 +66,8 @@ pub(crate) async fn handle_get_album_list(authed: Authed) -> ApiResult {
     let list_type = authed.params.list_type.as_deref().unwrap_or("alphabeticalByName");
     let size = authed.params.size.unwrap_or(10).min(500);
     let offset = authed.params.offset.unwrap_or(0);
-    let sub_albums = fetch_album_list(authed.tidal(), list_type, size, offset)
+    let client = authed.tidal().await?;
+    let sub_albums = fetch_album_list(&client, list_type, size, offset)
         .await
         .map_err(ApiError::Tidal)?;
     Ok(Payload::AlbumList(AlbumList { album: sub_albums }).into())
@@ -76,14 +77,15 @@ pub(crate) async fn handle_get_album_list2(authed: Authed) -> ApiResult {
     let list_type = authed.params.list_type.as_deref().unwrap_or("alphabeticalByName");
     let size = authed.params.size.unwrap_or(10).min(500);
     let offset = authed.params.offset.unwrap_or(0);
-    let sub_albums = fetch_album_list(authed.tidal(), list_type, size, offset)
+    let client = authed.tidal().await?;
+    let sub_albums = fetch_album_list(&client, list_type, size, offset)
         .await
         .map_err(ApiError::Tidal)?;
     Ok(Payload::AlbumList2(AlbumList { album: sub_albums }).into())
 }
 
 pub(crate) async fn handle_get_starred(authed: Authed, headers: HeaderMap) -> ApiResult {
-    let client = authed.tidal();
+    let client = authed.tidal().await?;
     let user_id = authed.tidal_user_id().await?;
     let base_url = base_url_from_headers(&headers);
 
@@ -146,7 +148,7 @@ fn collect_star_targets(params: &SubsonicParams) -> Vec<ItemId> {
 
 pub(crate) async fn handle_star(authed: Authed) -> ApiResult {
     let targets = collect_star_targets(&authed.params);
-    let client = authed.tidal();
+    let client = authed.tidal().await?;
     for target in targets {
         let res = match target {
             ItemId::Track(id) => client.add_favorite_track(id).await,
@@ -161,7 +163,7 @@ pub(crate) async fn handle_star(authed: Authed) -> ApiResult {
 
 pub(crate) async fn handle_unstar(authed: Authed) -> ApiResult {
     let targets = collect_star_targets(&authed.params);
-    let client = authed.tidal();
+    let client = authed.tidal().await?;
     for target in targets {
         let res = match target {
             ItemId::Track(id) => client.remove_favorite_track(id).await,

@@ -6,7 +6,7 @@ use crate::subsonic::*;
 use axum::http::HeaderMap;
 
 pub(crate) async fn handle_get_playlists(authed: Authed) -> ApiResult {
-    let client = authed.tidal();
+    let client = authed.tidal().await?;
     let user_id = authed.tidal_user_id().await?;
     let playlists = client
         .get_user_playlists(user_id, 0, 200)
@@ -34,7 +34,7 @@ pub(crate) async fn handle_get_playlist(authed: Authed, headers: HeaderMap) -> A
         _ => return Err(ApiError::BadRequest(0, "Invalid playlist id".to_string())),
     };
 
-    let client = authed.tidal();
+    let client = authed.tidal().await?;
     // Fetch playlist metadata (name/owner/cover) alongside its tracks.
     let meta = client.get_playlist(&playlist_uuid).await.ok();
     let tracks = client

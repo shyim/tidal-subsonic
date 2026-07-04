@@ -1,8 +1,9 @@
 use crate::auth::PkceSession;
+use crate::crypto::Cipher;
 use crate::db::SharedDb;
 use crate::response::ResponseFormat;
 use crate::routes::media_cache::MediaCache;
-use crate::tidal::SharedTidalClient;
+use crate::tidal::ClientRegistry;
 use axum::http::HeaderMap;
 use reqwest::Client as ReqwestClient;
 use serde::Deserialize;
@@ -11,12 +12,12 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub(crate) struct AppState {
-    pub(crate) tidal: SharedTidalClient,
+    /// Per-user TIDAL clients — resolve one for the authenticated user.
+    pub(crate) registry: ClientRegistry,
     pub(crate) db: SharedDb,
+    pub(crate) cipher: Cipher,
     pub(crate) http_client: ReqwestClient,
     pub(crate) pkce_sessions: Arc<tokio::sync::Mutex<HashMap<String, PkceSession>>>,
-    pub(crate) subsonic_password: String,
-    pub(crate) subsonic_username: String,
     pub(crate) max_quality: String,
     pub(crate) media_cache: MediaCache,
 }

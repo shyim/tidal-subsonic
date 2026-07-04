@@ -1,5 +1,5 @@
 use crate::app::{AppState, SubsonicParams};
-use crate::auth_mw::{verify_auth, xml_error, RESPONSE_CTX};
+use crate::auth_mw::{resolve_user, xml_error, RESPONSE_CTX};
 use crate::response::{self, ResponseFormat};
 use axum::{
     extract::State,
@@ -38,7 +38,7 @@ pub(crate) async fn handle_not_implemented(
     let format = ResponseFormat::from_param(parsed.get("f").map(|s| s.as_str()));
     let callback = parsed.get("callback").map(|s| s.as_str());
 
-    if !verify_auth(&state, &auth_params) {
+    if resolve_user(&state, &auth_params).await.is_none() {
         return response::render(&xml_error(40, "Wrong username or password"), format, callback);
     }
     // Unknown /rest endpoint: report a Subsonic error (code 0) so clients don't

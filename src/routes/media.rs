@@ -131,13 +131,14 @@ pub(crate) async fn handle_stream(authed: Authed, headers: HeaderMap) -> Respons
         "LOW"
     };
 
-    let stream_info = {
-        let client = &state.tidal;
-        match client.get_streamable_url(track_id, ceiling).await {
-            Ok(info) => info,
-            Err(e) => {
-                return render_current(&xml_error(0, &format!("Stream URL error: {}", e)));
-            }
+    let client = match authed.tidal().await {
+        Ok(c) => c,
+        Err(_) => return render_current(&xml_error(0, "Not authenticated with TIDAL")),
+    };
+    let stream_info = match client.get_streamable_url(track_id, ceiling).await {
+        Ok(info) => info,
+        Err(e) => {
+            return render_current(&xml_error(0, &format!("Stream URL error: {}", e)));
         }
     };
 

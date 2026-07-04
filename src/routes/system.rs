@@ -1,5 +1,5 @@
 use crate::app::{AppState, SubsonicParams};
-use crate::auth_mw::{respond, verify_auth, xml_ok, ApiOk, ApiResult, Authed};
+use crate::auth_mw::{respond, xml_ok, ApiOk, ApiResult, Authed};
 use crate::subsonic::*;
 use axum::{
     extract::{Query, State},
@@ -37,12 +37,13 @@ pub(crate) async fn handle_scrobble(_authed: Authed) -> ApiResult {
 }
 
 pub(crate) async fn handle_get_user(authed: Authed) -> ApiResult {
+    let is_admin = authed.user.is_admin;
     Ok(Payload::User(SubsonicUser {
-        username: authed.state.subsonic_username.clone(),
+        username: authed.user.username.clone(),
         email: None,
         scrobbling_enabled: Some(false),
-        admin_role: Some(true),
-        settings_role: Some(true),
+        admin_role: Some(is_admin),
+        settings_role: Some(is_admin),
         download_role: Some(true),
         upload_role: Some(false),
         playlist_role: Some(true),
@@ -104,7 +105,7 @@ pub(crate) async fn handle_get_avatar(
 ) -> Response {
     // Avatar keeps its own auth check: on failure it returns a plain HTTP 401
     // (not a Subsonic-shaped body), so it must not use the `Authed` extractor.
-    if !verify_auth(&state, &params) {
+    if crate::auth_mw::resolve_user(&state, &params).await.is_none() {
         return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
     }
     // Return a 1x1 transparent PNG as default avatar

@@ -305,13 +305,31 @@ async fn handle_callback(
         Ok((access_token, refresh_token, user_id)) => {
             // Get country code from session
             let cc = get_country_code(&client, &access_token).await.unwrap_or_else(|_| "US".to_string());
-            
-            // Save tokens to DB
-            db::save_tokens(&state.db, &access_token, &refresh_token, Some(user_id), &cc).await.ok();
 
-            // Push tokens into the running TidalClient immediately
-            state.tidal.set_tokens(access_token.clone(), refresh_token.clone(), Some(user_id), cc.clone()).await;
-            tracing::info!("TIDAL authenticated as user {}", user_id);
+            // Link the TIDAL account to the target Subsonic user. Until per-user
+            // OAuth linking (step 4) exists, this targets the admin (the migrated
+            // single user).
+            let account = db::TidalAccount {
+                access_token: access_token.clone(),
+                refresh_token: refresh_token.clone(),
+                tidal_user_id: Some(user_id),
+                country_code: cc.clone(),
+            };
+            if let Some(target_user_id) = db::first_admin_id(&state.db).await {
+                db::save_tidal_account(&state.db, &state.cipher, target_user_id, &account)
+                    .await
+                    .ok();
+                // Drop any cached client so the next request rebuilds with the
+                // fresh tokens.
+                state.registry.invalidate(target_user_id).await;
+                tracing::info!(
+                    "Linked TIDAL account (tidal user {}) to Subsonic user {}",
+                    user_id,
+                    target_user_id
+                );
+            } else {
+                tracing::warn!("No admin user to link the TIDAL account to");
+            }
 
             // Clear PKCE session
             {

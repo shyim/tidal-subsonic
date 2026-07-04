@@ -17,7 +17,7 @@ pub(crate) async fn handle_search2(authed: Authed, headers: HeaderMap) -> ApiRes
     let song_count = authed.params.song_count.unwrap_or(20);
     let song_offset = authed.params.song_offset.unwrap_or(0);
 
-    let client = authed.tidal();
+    let client = authed.tidal().await?;
     let results = client.search(&query, 50).await.map_err(ApiError::Tidal)?;
     let base_url = base_url_from_headers(&headers);
     let artists: Vec<SubsonicArtist> = results.artists[artist_offset as usize..]
@@ -57,7 +57,7 @@ pub(crate) async fn handle_search3(authed: Authed, headers: HeaderMap) -> ApiRes
     let song_count = authed.params.song_count.unwrap_or(20);
     let song_offset = authed.params.song_offset.unwrap_or(0);
 
-    let client = authed.tidal();
+    let client = authed.tidal().await?;
     let results = client.search(&query, 50).await.map_err(ApiError::Tidal)?;
     let base_url = base_url_from_headers(&headers);
     let artists: Vec<SubsonicArtist> = results.artists[artist_offset as usize..]

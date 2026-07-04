@@ -6,7 +6,7 @@ use crate::subsonic::*;
 use axum::http::HeaderMap;
 
 pub(crate) async fn handle_get_indexes(authed: Authed) -> ApiResult {
-    let client = authed.tidal();
+    let client = authed.tidal().await?;
     let user_id = authed.tidal_user_id().await?;
     let artists = client
         .get_favorite_artists(user_id, 0, 500)
@@ -16,7 +16,7 @@ pub(crate) async fn handle_get_indexes(authed: Authed) -> ApiResult {
 }
 
 pub(crate) async fn handle_get_artists(authed: Authed) -> ApiResult {
-    let client = authed.tidal();
+    let client = authed.tidal().await?;
     let user_id = authed.tidal_user_id().await?;
     let artists = client
         .get_favorite_artists(user_id, 0, 500)
@@ -41,7 +41,7 @@ pub(crate) async fn handle_get_artist(authed: Authed) -> ApiResult {
         _ => return Err(ApiError::BadRequest(0, "Invalid artist id".to_string())),
     };
 
-    let client = authed.tidal();
+    let client = authed.tidal().await?;
     let artist_detail = client
         .get_artist_detail(artist_id)
         .await
@@ -74,7 +74,7 @@ pub(crate) async fn handle_get_album(authed: Authed, headers: HeaderMap) -> ApiR
         _ => return Err(ApiError::BadRequest(0, "Invalid album id".to_string())),
     };
 
-    let client = authed.tidal();
+    let client = authed.tidal().await?;
     let base_url = base_url_from_headers(&headers);
     let album = client
         .get_album_detail(album_id)
@@ -105,7 +105,7 @@ pub(crate) async fn handle_get_music_directory(authed: Authed, headers: HeaderMa
         .clone()
         .ok_or_else(|| ApiError::BadRequest(10, "Missing directory id".to_string()))?;
     let base_url = base_url_from_headers(&headers);
-    let client = authed.tidal();
+    let client = authed.tidal().await?;
 
     match dir_id.parse::<ItemId>() {
         Ok(ItemId::Artist(artist_id)) => {
@@ -170,7 +170,7 @@ pub(crate) async fn handle_get_song(authed: Authed, headers: HeaderMap) -> ApiRe
         _ => return Err(ApiError::BadRequest(0, "Invalid track id".to_string())),
     };
 
-    let client = authed.tidal();
+    let client = authed.tidal().await?;
     let track = client.get_track(track_id).await.map_err(ApiError::Tidal)?;
     let base_url = base_url_from_headers(&headers);
     Ok(Payload::Song(mapping::track_to_child(&track, &base_url)).into())

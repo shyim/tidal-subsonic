@@ -1,4 +1,5 @@
 use crate::app::{AppState, SubsonicParams};
+use crate::db::{self, User};
 use crate::response::{self, ResponseFormat};
 use crate::subsonic::{Payload, SubsonicResponse};
 use crate::tidal::SharedTidalClient;
@@ -46,19 +47,31 @@ pub(crate) fn xml_ok() -> SubsonicResponse {
     SubsonicResponse::ok()
 }
 
-pub(crate) fn verify_auth(state: &AppState, params: &SubsonicParams) -> bool {
-    if params.u != state.subsonic_username {
-        return false;
+/// Verify a Subsonic user's credentials against their stored password (token
+/// `t`+`s` or legacy `p=`). Returns the authenticated `User`, or None on any
+/// mismatch / unknown user.
+pub(crate) async fn resolve_user(state: &AppState, params: &SubsonicParams) -> Option<User> {
+    if params.u.is_empty() {
+        return None;
     }
+    let user = db::find_user(&state.db, &state.cipher, &params.u).await?;
+    if credentials_match(&user.password, params) {
+        Some(user)
+    } else {
+        None
+    }
+}
+
+/// Check a request's credentials against the given plaintext password.
+pub(crate) fn credentials_match(password: &str, params: &SubsonicParams) -> bool {
     // Token auth: t = md5(password + salt).
     if let (Some(t), Some(s)) = (&params.t, &params.s) {
-        let expected = format!("{:x}", md5::compute(format!("{}{}", state.subsonic_password, s)));
+        let expected = format!("{:x}", md5::compute(format!("{}{}", password, s)));
         return t == &expected;
     }
     // Legacy password auth: p = password or "enc:<hex>".
     if let Some(p) = &params.p {
-        let plaintext = decode_password(p);
-        return plaintext == state.subsonic_password;
+        return decode_password(p) == password;
     }
     false
 }
@@ -87,22 +100,24 @@ pub(crate) fn decode_password(p: &str) -> String {
 pub(crate) struct Authed {
     pub(crate) state: AppState,
     pub(crate) params: SubsonicParams,
+    pub(crate) user: User,
 }
 
 impl Authed {
-    /// The shared TIDAL client for this request.
-    pub(crate) fn tidal(&self) -> &SharedTidalClient {
-        &self.state.tidal
-    }
-
-    /// The authenticated TIDAL user id, or `ApiError::NotAuthedTidal` if the
-    /// proxy has no TIDAL session yet.
-    pub(crate) async fn tidal_user_id(&self) -> Result<u64, ApiError> {
+    /// The authenticated user's TIDAL client, or `ApiError::NotAuthedTidal` if
+    /// they haven't linked a TIDAL account yet.
+    pub(crate) async fn tidal(&self) -> Result<SharedTidalClient, ApiError> {
         self.state
-            .tidal
-            .user_id()
+            .registry
+            .get(self.user.id)
             .await
             .ok_or(ApiError::NotAuthedTidal)
+    }
+
+    /// The authenticated TIDAL user id for the current user's account.
+    pub(crate) async fn tidal_user_id(&self) -> Result<u64, ApiError> {
+        let client = self.tidal().await?;
+        client.user_id().await.ok_or(ApiError::NotAuthedTidal)
     }
 }
 
@@ -117,12 +132,11 @@ impl FromRequestParts<AppState> for Authed {
         let Query(params) = Query::<SubsonicParams>::from_request_parts(parts, state)
             .await
             .unwrap_or_else(|_| Query(SubsonicParams::default()));
-        if !verify_auth(state, &params) {
-            return Err(ApiError::Auth);
-        }
+        let user = resolve_user(state, &params).await.ok_or(ApiError::Auth)?;
         Ok(Authed {
             state: state.clone(),
             params,
+            user,
         })
     }
 }

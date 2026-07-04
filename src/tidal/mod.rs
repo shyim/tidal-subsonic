@@ -4,7 +4,9 @@
 mod api;
 pub mod client;
 pub(crate) mod dash;
+pub mod registry;
 pub mod types;
 
 pub use client::*;
+pub use registry::ClientRegistry;
 pub use types::*;

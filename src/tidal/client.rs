@@ -45,19 +45,30 @@ pub struct TidalClient {
     client_id: String,
     client_secret: String,
     db: SharedDb,
+    /// The Subsonic user this client belongs to — token persistence writes to
+    /// this user's `tidal_accounts` row so users can't clobber each other.
+    subsonic_user_id: i64,
+    cipher: crate::crypto::Cipher,
 }
 
 impl TidalClient {
-    pub fn from_db_config(cfg: &DbConfig, db: SharedDb) -> Self {
+    /// Build a client for a specific Subsonic user from their linked TIDAL
+    /// account. `client_id`/`client_secret` are the app-level TIDAL OAuth
+    /// credentials (shared across users).
+    pub fn for_user(
+        subsonic_user_id: i64,
+        account: &crate::db::TidalAccount,
+        client_id: String,
+        client_secret: String,
+        db: SharedDb,
+        cipher: crate::crypto::Cipher,
+    ) -> Self {
         let creds = Creds {
-            access_token: cfg.tidal_access_token.clone(),
-            refresh_token: cfg.tidal_refresh_token.clone(),
-            user_id: cfg.tidal_user_id,
-            country_code: cfg.tidal_country_code.clone(),
+            access_token: account.access_token.clone(),
+            refresh_token: account.refresh_token.clone(),
+            user_id: account.tidal_user_id,
+            country_code: account.country_code.clone(),
         };
-        let client_id = cfg.tidal_client_id.clone();
-        let client_secret = cfg.tidal_client_secret.clone();
-
         Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
@@ -67,6 +78,8 @@ impl TidalClient {
             client_id,
             client_secret,
             db,
+            subsonic_user_id,
+            cipher,
         }
     }
 
@@ -78,20 +91,24 @@ impl TidalClient {
         creds.country_code = country_code;
     }
 
-    /// Persist the current credentials to the DB. Call whenever tokens change so
-    /// a rotated refresh token survives a restart.
+    /// Persist the current credentials to this user's `tidal_accounts` row. Call
+    /// whenever tokens change so a rotated refresh token survives a restart.
     pub(super) async fn persist_creds(&self) {
         let creds = self.creds.lock().await.clone();
-        if let Err(e) = db::save_tokens(
-            &self.db,
-            &creds.access_token,
-            &creds.refresh_token,
-            creds.user_id,
-            &creds.country_code,
-        )
-        .await
+        let account = db::TidalAccount {
+            access_token: creds.access_token,
+            refresh_token: creds.refresh_token,
+            tidal_user_id: creds.user_id,
+            country_code: creds.country_code,
+        };
+        if let Err(e) =
+            db::save_tidal_account(&self.db, &self.cipher, self.subsonic_user_id, &account).await
         {
-            tracing::warn!("Failed to persist TIDAL tokens: {}", e);
+            tracing::warn!(
+                "Failed to persist TIDAL tokens for user {}: {}",
+                self.subsonic_user_id,
+                e
+            );
         }
     }
 
