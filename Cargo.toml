@@ -37,6 +37,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # URL handling
 url = "2"
+serde_urlencoded = "0.7"
 
 # XML parsing for DASH manifests
 roxmltree = "0.20"

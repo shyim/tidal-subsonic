@@ -4,7 +4,7 @@ use crate::response::{self, ResponseFormat};
 use crate::subsonic::{Payload, SubsonicResponse};
 use crate::tidal::SharedTidalClient;
 use axum::{
-    extract::{FromRequestParts, Query},
+    extract::FromRequestParts,
     http::request::Parts,
     response::{IntoResponse, Response},
 };
@@ -129,9 +129,8 @@ impl FromRequestParts<AppState> for Authed {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let Query(params) = Query::<SubsonicParams>::from_request_parts(parts, state)
-            .await
-            .unwrap_or_else(|_| Query(SubsonicParams::default()));
+        // Parse manually so repeated params (songId=, albumId=) collect into Vecs.
+        let params = SubsonicParams::from_query(parts.uri.query().unwrap_or(""));
         let user = resolve_user(state, &params).await.ok_or(ApiError::Auth)?;
         Ok(Authed {
             state: state.clone(),

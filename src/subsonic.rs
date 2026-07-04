@@ -17,6 +17,9 @@ pub enum Payload {
     AlbumList(AlbumList),
     AlbumList2(AlbumList),
     RandomSongs(SongList),
+    TopSongs(SongList),
+    SimilarSongs(SongList),
+    SimilarSongs2(SongList),
     NowPlaying(NowPlaying),
     /// getStarred emits both `<starred>` and `<starred2>` in one response.
     Starred(Starred, Starred2),
@@ -34,6 +37,11 @@ pub enum Payload {
     Lyrics(Lyrics),
     /// OpenSubsonic `getLyricsBySongId` result: a structured `<lyricsList>`.
     LyricsList(LyricsList),
+    ArtistInfo(ArtistInfo),
+    ArtistInfo2(ArtistInfo),
+    AlbumInfo(AlbumInfo),
+    PlayQueue(PlayQueue),
+    Bookmarks(Bookmarks),
 }
 
 impl Payload {
@@ -51,6 +59,9 @@ impl Payload {
             Payload::AlbumList(v) => st.serialize_field("albumList", v),
             Payload::AlbumList2(v) => st.serialize_field("albumList2", v),
             Payload::RandomSongs(v) => st.serialize_field("randomSongs", v),
+            Payload::TopSongs(v) => st.serialize_field("topSongs", v),
+            Payload::SimilarSongs(v) => st.serialize_field("similarSongs", v),
+            Payload::SimilarSongs2(v) => st.serialize_field("similarSongs2", v),
             Payload::NowPlaying(v) => st.serialize_field("nowPlaying", v),
             Payload::Starred(s, s2) => {
                 st.serialize_field("starred", s)?;
@@ -68,6 +79,11 @@ impl Payload {
             Payload::Directory(v) => st.serialize_field("directory", v),
             Payload::Lyrics(v) => st.serialize_field("lyrics", v),
             Payload::LyricsList(v) => st.serialize_field("lyricsList", v),
+            Payload::ArtistInfo(v) => st.serialize_field("artistInfo", v),
+            Payload::ArtistInfo2(v) => st.serialize_field("artistInfo2", v),
+            Payload::AlbumInfo(v) => st.serialize_field("albumInfo", v),
+            Payload::PlayQueue(v) => st.serialize_field("playQueue", v),
+            Payload::Bookmarks(v) => st.serialize_field("bookmarks", v),
         }
     }
 
@@ -748,4 +764,82 @@ pub struct LyricLine {
     pub start: Option<i64>,
     #[serde(rename = "$value")]
     pub value: String,
+}
+
+// ------ Play queue & bookmarks ------
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct PlayQueue {
+    #[serde(rename = "@current", skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+    #[serde(rename = "@position", skip_serializing_if = "Option::is_none")]
+    pub position: Option<u64>,
+    #[serde(rename = "@username")]
+    pub username: String,
+    #[serde(rename = "@changed", skip_serializing_if = "Option::is_none")]
+    pub changed: Option<String>,
+    #[serde(rename = "@changedBy", skip_serializing_if = "Option::is_none")]
+    pub changed_by: Option<String>,
+    #[serde(rename = "entry", default)]
+    pub entry: Vec<SubsonicChild>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct Bookmarks {
+    #[serde(rename = "bookmark", default)]
+    pub bookmark: Vec<Bookmark>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Bookmark {
+    #[serde(rename = "@position")]
+    pub position: u64,
+    #[serde(rename = "@username")]
+    pub username: String,
+    #[serde(rename = "@comment", skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(rename = "@created", skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+    #[serde(rename = "@changed", skip_serializing_if = "Option::is_none")]
+    pub changed: Option<String>,
+    #[serde(rename = "entry")]
+    pub entry: SubsonicChild,
+}
+
+// ------ Artist / Album info ------
+
+/// `getArtistInfo` / `getArtistInfo2`. The sub-fields are child text elements;
+/// `similar_artist` holds `<similarArtist>` entries (SubsonicArtist shape).
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ArtistInfo {
+    #[serde(rename = "biography", skip_serializing_if = "String::is_empty", default)]
+    pub biography: String,
+    #[serde(rename = "musicBrainzId", skip_serializing_if = "Option::is_none")]
+    pub music_brainz_id: Option<String>,
+    #[serde(rename = "lastFmUrl", skip_serializing_if = "Option::is_none")]
+    pub last_fm_url: Option<String>,
+    #[serde(rename = "smallImageUrl", skip_serializing_if = "Option::is_none")]
+    pub small_image_url: Option<String>,
+    #[serde(rename = "mediumImageUrl", skip_serializing_if = "Option::is_none")]
+    pub medium_image_url: Option<String>,
+    #[serde(rename = "largeImageUrl", skip_serializing_if = "Option::is_none")]
+    pub large_image_url: Option<String>,
+    #[serde(rename = "similarArtist", default, skip_serializing_if = "Vec::is_empty")]
+    pub similar_artist: Vec<SubsonicArtist>,
+}
+
+/// `getAlbumInfo` / `getAlbumInfo2`. TIDAL has no rich album notes, so `notes`
+/// is usually empty; the image URLs point at the album cover.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct AlbumInfo {
+    #[serde(rename = "notes", skip_serializing_if = "String::is_empty", default)]
+    pub notes: String,
+    #[serde(rename = "musicBrainzId", skip_serializing_if = "Option::is_none")]
+    pub music_brainz_id: Option<String>,
+    #[serde(rename = "smallImageUrl", skip_serializing_if = "Option::is_none")]
+    pub small_image_url: Option<String>,
+    #[serde(rename = "mediumImageUrl", skip_serializing_if = "Option::is_none")]
+    pub medium_image_url: Option<String>,
+    #[serde(rename = "largeImageUrl", skip_serializing_if = "Option::is_none")]
+    pub large_image_url: Option<String>,
 }

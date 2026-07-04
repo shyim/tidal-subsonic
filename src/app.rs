@@ -149,6 +149,46 @@ impl SubsonicParams {
     pub(crate) fn format(&self) -> ResponseFormat {
         ResponseFormat::from_param(self.f.as_deref())
     }
+
+    /// Parse a query string, correctly collecting repeated keys (e.g. `songId=`,
+    /// `albumId=`) into the `Vec` fields. `serde_urlencoded` (what axum's `Query`
+    /// uses) can't deserialize repeated keys into a `Vec`, so we split the work:
+    /// scalar fields go through serde (first value wins), and the known
+    /// multi-value keys are collected by hand.
+    pub(crate) fn from_query(query: &str) -> Self {
+        use std::collections::HashMap;
+        // These keys map to Vec fields; serde_urlencoded can't handle them, so
+        // exclude them from the scalar query and collect them by hand below.
+        const MULTI_KEYS: &[&str] = &["songId", "albumId", "songIdToAdd", "songIndexToRemove"];
+        let mut scalars: HashMap<String, String> = HashMap::new();
+        let mut multi: HashMap<String, Vec<String>> = HashMap::new();
+        for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+            if MULTI_KEYS.contains(&k.as_ref()) {
+                multi.entry(k.to_string()).or_default().push(v.to_string());
+            } else {
+                // First value wins for scalar deserialization.
+                scalars.entry(k.to_string()).or_insert_with(|| v.to_string());
+            }
+        }
+        // Re-encode the deduplicated scalars for serde.
+        let scalar_query: String = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(scalars.iter())
+            .finish();
+        let mut params: SubsonicParams =
+            serde_urlencoded::from_str(&scalar_query).unwrap_or_default();
+
+        // Overwrite the multi-value fields from the collected lists.
+        let take = |key: &str| -> Option<Vec<String>> {
+            multi.get(key).filter(|v| !v.is_empty()).cloned()
+        };
+        params.song_id = take("songId");
+        params.album_id = take("albumId");
+        params.song_id_to_add = take("songIdToAdd");
+        params.song_index_to_remove = take("songIndexToRemove").map(|v| {
+            v.iter().filter_map(|s| s.parse::<u32>().ok()).collect()
+        });
+        params
+    }
 }
 
 pub(crate) fn base_url_from_headers(headers: &HeaderMap) -> String {
@@ -162,4 +202,38 @@ pub(crate) fn base_url_from_headers(headers: &HeaderMap) -> String {
         "http"
     };
     format!("{}://{}", proto, host)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_query_parses_scalars_and_auth() {
+        let p = SubsonicParams::from_query("u=alice&t=abc123&s=deadbeef&v=1.16.1&c=app&f=json&id=tr-5");
+        assert_eq!(p.u, "alice");
+        assert_eq!(p.t.as_deref(), Some("abc123"));
+        assert_eq!(p.s.as_deref(), Some("deadbeef"));
+        assert_eq!(p.id.as_deref(), Some("tr-5"));
+        assert_eq!(p.format(), ResponseFormat::Json);
+    }
+
+    #[test]
+    fn from_query_collects_repeated_keys() {
+        let p = SubsonicParams::from_query(
+            "u=a&t=x&s=y&songId=tr-1&songId=tr-2&songId=tr-3&albumId=al-9&songIndexToRemove=0&songIndexToRemove=2",
+        );
+        // Auth fields survive alongside the repeated keys.
+        assert_eq!(p.u, "a");
+        assert_eq!(p.song_id, Some(vec!["tr-1".into(), "tr-2".into(), "tr-3".into()]));
+        assert_eq!(p.album_id, Some(vec!["al-9".into()]));
+        assert_eq!(p.song_index_to_remove, Some(vec![0, 2]));
+    }
+
+    #[test]
+    fn from_query_handles_type_and_percent_encoding() {
+        let p = SubsonicParams::from_query("u=u&type=newest&query=daft%20punk");
+        assert_eq!(p.list_type.as_deref(), Some("newest"));
+        assert_eq!(p.query.as_deref(), Some("daft punk"));
+    }
 }

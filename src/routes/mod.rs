@@ -1,4 +1,5 @@
 pub(crate) mod browsing;
+pub(crate) mod discovery;
 pub(crate) mod fallback;
 pub(crate) mod lists;
 pub(crate) mod lyrics;
@@ -6,6 +7,7 @@ pub(crate) mod media;
 pub(crate) mod media_cache;
 pub(crate) mod metadata_cache;
 pub(crate) mod playlists;
+pub(crate) mod queue;
 pub(crate) mod search;
 pub(crate) mod system;
 pub(crate) mod transcode;

@@ -13,7 +13,9 @@ mod tidal;
 use app::AppState;
 use axum::routing::get;
 use reqwest::Client as ReqwestClient;
-use routes::{browsing, fallback, lists, lyrics, media, playlists, search, system, users};
+use routes::{
+    browsing, discovery, fallback, lists, lyrics, media, playlists, queue, search, system, users,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
@@ -97,6 +99,13 @@ async fn main() {
         ("getMusicDirectory", get(browsing::handle_get_music_directory)),
         ("getAlbum", get(browsing::handle_get_album)),
         ("getSong", get(browsing::handle_get_song)),
+        ("getTopSongs", get(discovery::handle_get_top_songs)),
+        ("getSimilarSongs", get(discovery::handle_get_similar_songs)),
+        ("getSimilarSongs2", get(discovery::handle_get_similar_songs2)),
+        ("getArtistInfo", get(discovery::handle_get_artist_info)),
+        ("getArtistInfo2", get(discovery::handle_get_artist_info2)),
+        ("getAlbumInfo", get(discovery::handle_get_album_info)),
+        ("getAlbumInfo2", get(discovery::handle_get_album_info)),
         ("getLyrics", get(lyrics::handle_get_lyrics)),
         ("getLyricsBySongId", get(lyrics::handle_get_lyrics_by_song_id)),
         ("getRandomSongs", get(lists::handle_get_random_songs)),
@@ -127,6 +136,11 @@ async fn main() {
         ("startScan", get(system::handle_start_scan)),
         ("getGenres", get(system::handle_get_genres)),
         ("getNowPlaying", get(system::handle_get_now_playing)),
+        ("savePlayQueue", get(queue::handle_save_play_queue)),
+        ("getPlayQueue", get(queue::handle_get_play_queue)),
+        ("createBookmark", get(queue::handle_create_bookmark)),
+        ("getBookmarks", get(queue::handle_get_bookmarks)),
+        ("deleteBookmark", get(queue::handle_delete_bookmark)),
         (
             "getOpenSubsonicExtensions",
             get(system::handle_get_open_subsonic_extensions),

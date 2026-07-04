@@ -28,6 +28,26 @@ pub struct TidalAccount {
     pub country_code: String,
 }
 
+/// A saved play queue (Subsonic track ids, current, and position).
+#[derive(Debug, Clone)]
+pub struct PlayQueueRow {
+    pub track_ids: Vec<String>,
+    pub current: Option<String>,
+    pub position_ms: u64,
+    pub changed_by: Option<String>,
+    pub changed_at: String,
+}
+
+/// A per-track bookmark.
+#[derive(Debug, Clone)]
+pub struct BookmarkRow {
+    pub track_id: String,
+    pub position_ms: u64,
+    pub comment: Option<String>,
+    pub created_at: String,
+    pub changed_at: String,
+}
+
 /// Server-level config (the TIDAL app OAuth credentials + server settings).
 /// Per-user Subsonic credentials and TIDAL tokens live in their own tables.
 #[derive(Debug, Clone)]
@@ -95,6 +115,27 @@ pub fn open_db(db_path: &Path) -> Result<SharedDb> {
             tidal_user_id       INTEGER,
             country_code        TEXT NOT NULL DEFAULT 'US',
             updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        -- Per-user saved play queue (resume across devices). One row per user.
+        CREATE TABLE IF NOT EXISTS play_queue (
+            user_id     INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            track_ids   TEXT NOT NULL,          -- comma-separated Subsonic track ids
+            current     TEXT,                   -- the current Subsonic track id
+            position_ms INTEGER NOT NULL DEFAULT 0,
+            changed_by  TEXT,                   -- client name that last saved
+            changed_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        -- Per-user per-track bookmarks (resume position within a track).
+        CREATE TABLE IF NOT EXISTS bookmarks (
+            user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            track_id    TEXT NOT NULL,          -- Subsonic track id
+            position_ms INTEGER NOT NULL,
+            comment     TEXT,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            changed_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (user_id, track_id)
         );",
     )?;
 
@@ -388,6 +429,102 @@ pub async fn load_tidal_account(
     .optional()
     .ok()
     .flatten()
+}
+
+// ---- Play queue & bookmarks (per user) ----
+
+pub async fn save_play_queue(
+    db: &SharedDb,
+    user_id: i64,
+    track_ids: &[String],
+    current: Option<&str>,
+    position_ms: u64,
+    changed_by: Option<&str>,
+) -> Result<()> {
+    let conn = db.lock().await;
+    conn.execute(
+        "INSERT INTO play_queue (user_id, track_ids, current, position_ms, changed_by, changed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+         ON CONFLICT(user_id) DO UPDATE SET
+           track_ids = excluded.track_ids, current = excluded.current,
+           position_ms = excluded.position_ms, changed_by = excluded.changed_by,
+           changed_at = excluded.changed_at",
+        params![user_id, track_ids.join(","), current, position_ms as i64, changed_by],
+    )?;
+    Ok(())
+}
+
+pub async fn load_play_queue(db: &SharedDb, user_id: i64) -> Option<PlayQueueRow> {
+    let conn = db.lock().await;
+    conn.query_row(
+        "SELECT track_ids, current, position_ms, changed_by, changed_at FROM play_queue WHERE user_id = ?1",
+        params![user_id],
+        |row| {
+            let ids: String = row.get(0)?;
+            Ok(PlayQueueRow {
+                track_ids: ids.split(',').filter(|s| !s.is_empty()).map(String::from).collect(),
+                current: row.get(1)?,
+                position_ms: row.get::<_, i64>(2)? as u64,
+                changed_by: row.get(3)?,
+                changed_at: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+pub async fn save_bookmark(
+    db: &SharedDb,
+    user_id: i64,
+    track_id: &str,
+    position_ms: u64,
+    comment: Option<&str>,
+) -> Result<()> {
+    let conn = db.lock().await;
+    conn.execute(
+        "INSERT INTO bookmarks (user_id, track_id, position_ms, comment, changed_at)
+         VALUES (?1, ?2, ?3, ?4, datetime('now'))
+         ON CONFLICT(user_id, track_id) DO UPDATE SET
+           position_ms = excluded.position_ms, comment = excluded.comment,
+           changed_at = excluded.changed_at",
+        params![user_id, track_id, position_ms as i64, comment],
+    )?;
+    Ok(())
+}
+
+pub async fn list_bookmarks(db: &SharedDb, user_id: i64) -> Vec<BookmarkRow> {
+    let conn = db.lock().await;
+    let mut stmt = match conn.prepare(
+        "SELECT track_id, position_ms, comment, created_at, changed_at
+         FROM bookmarks WHERE user_id = ?1 ORDER BY changed_at DESC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt.query_map(params![user_id], |row| {
+        Ok(BookmarkRow {
+            track_id: row.get(0)?,
+            position_ms: row.get::<_, i64>(1)? as u64,
+            comment: row.get(2)?,
+            created_at: row.get(3)?,
+            changed_at: row.get(4)?,
+        })
+    });
+    match rows {
+        Ok(iter) => iter.flatten().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+pub async fn delete_bookmark(db: &SharedDb, user_id: i64, track_id: &str) -> Result<()> {
+    let conn = db.lock().await;
+    conn.execute(
+        "DELETE FROM bookmarks WHERE user_id = ?1 AND track_id = ?2",
+        params![user_id, track_id],
+    )?;
+    Ok(())
 }
 
 /// Insert or update a user's TIDAL tokens (encrypted at rest).

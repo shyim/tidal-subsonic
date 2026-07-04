@@ -357,6 +357,29 @@ impl TidalClient {
         })
     }
 
+    /// Fetch an artist's biography text (empty string if TIDAL has none).
+    pub async fn get_artist_bio(&self, artist_id: u64) -> Result<String, String> {
+        let cc = self.country_code().await;
+        match self
+            .authenticated_get(
+                &format!("{}/artists/{}/bio", TIDAL_API_URL, artist_id),
+                &[("countryCode", &cc)],
+            )
+            .await
+        {
+            Ok(body) => {
+                let json: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                Ok(json
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string())
+            }
+            // Bio isn't always available — treat as empty, not an error.
+            Err(_) => Ok(String::new()),
+        }
+    }
+
     pub async fn get_artist_top_tracks(
         &self,
         artist_id: u64,
@@ -364,8 +387,9 @@ impl TidalClient {
         limit: u32,
     ) -> Result<PaginatedTracks, String> {
         let cc = self.country_code().await;
+        // The artist's popular tracks live at /toptracks (not /tracks).
         let body = self.authenticated_get(
-            &format!("{}/artists/{}/tracks", TIDAL_API_URL, artist_id),
+            &format!("{}/artists/{}/toptracks", TIDAL_API_URL, artist_id),
             &[
                 ("countryCode", &cc),
                 ("limit", &limit.to_string()),
@@ -377,6 +401,7 @@ impl TidalClient {
         #[serde(rename_all = "camelCase")]
         struct Resp {
             items: Vec<TidalTrack>,
+            #[serde(default)]
             total_number_of_items: u32,
         }
 
