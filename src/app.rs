@@ -22,7 +22,7 @@ pub(crate) struct WebSession {
 pub(crate) type WebSessions = Arc<tokio::sync::Mutex<HashMap<String, WebSession>>>;
 
 #[derive(Clone)]
-pub(crate) struct AppState {
+pub struct AppState {
     /// Per-user TIDAL clients — resolve one for the authenticated user.
     pub(crate) registry: ClientRegistry,
     pub(crate) db: SharedDb,

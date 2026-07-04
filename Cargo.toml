@@ -60,3 +60,8 @@ anyhow = "1"
 # e.g. the Garmin YuMusic app which declares Media.ENCODING_MP3.
 symphonia = { version = "0.5", default-features = false, features = ["aac", "isomp4"] }
 mp3lame-encoder = "0.2"
+
+[dev-dependencies]
+# Drive the axum Router in-process for integration tests (no TCP bind).
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
