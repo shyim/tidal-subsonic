@@ -236,19 +236,21 @@ Configure your Subsonic client with:
 
 ## Docker
 
-A multi-stage `Dockerfile` is included: a Node stage builds the web portal, an Alpine/musl stage produces a fully static binary, and the runtime is Google's **`distroless/static`** — no shell, no libc, no package manager. The result is a **~16 MB** image with minimal attack surface. TLS to TIDAL works with no CA certificates in the image, because rustls verifies against webpki roots compiled into the binary.
+Prebuilt multi-arch images (`linux/amd64` + `linux/arm64`) are published to the GitHub Container Registry — just pull and run:
 
 ```sh
-docker build -t tidal-subsonic .
-
 docker run -d --name tidal-subsonic \
   -p 4533:4533 \
   -e TIDAL_SUBSONIC_KEY="$(head -c 32 /dev/urandom | base64)" \
   -e TIDAL_SUBSONIC_ADMIN_PASSWORD="choose-a-strong-password" \
   -v tidal-subsonic-config:/config \
   -v tidal-subsonic-cache:/cache \
-  tidal-subsonic
+  ghcr.io/shyim/tidal-subsonic:latest
 ```
+
+The image is built from a multi-stage `Dockerfile`: a Node stage builds the web portal, an Alpine/musl stage produces a fully static binary, and the runtime is Google's **`distroless/static`** — no shell, no libc, no package manager. The result is a **~16 MB** image with minimal attack surface. TLS to TIDAL works with no CA certificates in the image, because rustls verifies against webpki roots compiled into the binary. Building it yourself is just `docker build -t tidal-subsonic .`.
+
+Images are published automatically by the `release` GitHub Actions workflow: push a version tag (`git tag v0.1.0 && git push --tags`) and it builds each architecture natively and pushes `latest` + the version tags.
 
 - The image sets `XDG_CONFIG_HOME=/config` and `XDG_CACHE_HOME=/cache`, so the database lands in `/config/tidal-subsonic/` and the media cache in `/cache/tidal-subsonic/`. **Mount both** to persist data.
 - **Set `TIDAL_SUBSONIC_KEY` explicitly** so the encryption key survives rebuilds. Without it, a new key is generated in the `/config` volume on first run.
