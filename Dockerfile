@@ -7,7 +7,9 @@ FROM node:22-slim AS web
 WORKDIR /web
 RUN corepack enable
 COPY web/package.json web/pnpm-lock.yaml* web/.npmrc* ./
-RUN pnpm install --frozen-lockfile || pnpm install
+# pnpm 11 exits non-zero when a dep build script is "ignored" (esbuild); our
+# build doesn't need esbuild's postinstall, so downgrade that to a warning.
+RUN pnpm install --frozen-lockfile --config.strict-dep-builds=false
 COPY web/ ./
 # pnpm 11 blocks a plain `pnpm build`; invoke Vite directly.
 RUN node node_modules/vite/bin/vite.js build
@@ -17,8 +19,11 @@ RUN node node_modules/vite/bin/vite.js build
 # and the LAME MP3 encoder (mp3lame-encoder builds LAME via `cc`) need.
 FROM rust:1-slim AS builder
 
+# build-essential + the C toolchain for SQLite/LAME; libssl-dev + perl for the
+# openssl-sys crate (reqwest's native-tls backend links system OpenSSL).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential pkg-config \
+    && apt-get install -y --no-install-recommends \
+        build-essential pkg-config libssl-dev perl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -39,9 +44,9 @@ RUN cargo build --release
 # binary produced above.
 FROM debian:stable-slim AS runtime
 
-# TLS for outbound HTTPS to TIDAL, plus CA certificates.
+# CA certificates + the OpenSSL runtime library the binary links against.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/tidal-subsonic /usr/local/bin/tidal-subsonic

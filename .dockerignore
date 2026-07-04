@@ -1,5 +1,7 @@
 # Build artifacts
 target/
+web/node_modules/
+web/dist/
 
 # Version control
 .git/

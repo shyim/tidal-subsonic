@@ -13,10 +13,5 @@
     "svelte": "^4.2.19",
     "vite": "^5.4.11",
     "vite-plugin-singlefile": "^2.0.3"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild"
-    ]
   }
 }

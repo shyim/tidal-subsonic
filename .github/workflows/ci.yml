@@ -41,7 +41,7 @@ jobs:
         working-directory: web
         run: |
           corepack enable
-          pnpm install --frozen-lockfile || pnpm install
+          pnpm install --frozen-lockfile --config.strict-dep-builds=false
           node node_modules/vite/bin/vite.js build
 
       - name: Cache cargo registry and build
