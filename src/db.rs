@@ -28,19 +28,15 @@ pub struct TidalAccount {
     pub country_code: String,
 }
 
+/// Server-level config (the TIDAL app OAuth credentials + server settings).
+/// Per-user Subsonic credentials and TIDAL tokens live in their own tables.
 #[derive(Debug, Clone)]
 pub struct DbConfig {
     pub tidal_client_id: String,
     pub tidal_client_secret: String,
-    pub tidal_access_token: String,
-    pub tidal_refresh_token: String,
-    pub tidal_user_id: Option<u64>,
-    pub tidal_country_code: String,
     pub tidal_max_quality: String,
     pub server_host: String,
     pub server_port: u16,
-    pub subsonic_username: String,
-    pub subsonic_password: String,
 }
 
 impl Default for DbConfig {
@@ -48,15 +44,9 @@ impl Default for DbConfig {
         Self {
             tidal_client_id: String::new(),
             tidal_client_secret: String::new(),
-            tidal_access_token: String::new(),
-            tidal_refresh_token: String::new(),
-            tidal_user_id: None,
-            tidal_country_code: "US".to_string(),
             tidal_max_quality: "HIGH".to_string(),
             server_host: "0.0.0.0".to_string(),
             server_port: 4533,
-            subsonic_username: "tidal".to_string(),
-            subsonic_password: "tidal".to_string(),
         }
     }
 }
@@ -248,17 +238,80 @@ pub async fn user_count(db: &SharedDb) -> i64 {
         .unwrap_or(0)
 }
 
-/// The id of the first admin user (lowest id), if any.
-pub async fn first_admin_id(db: &SharedDb) -> Option<i64> {
+/// All users, ordered by id (for admin listing).
+pub async fn list_users(db: &SharedDb, cipher: &Cipher) -> Vec<User> {
     let conn = db.lock().await;
-    conn.query_row(
-        "SELECT id FROM users WHERE is_admin = 1 ORDER BY id LIMIT 1",
-        [],
-        |r| r.get(0),
-    )
-    .optional()
-    .ok()
-    .flatten()
+    let mut stmt = match conn
+        .prepare("SELECT id, username, password_encrypted, is_admin FROM users ORDER BY id")
+    {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt.query_map([], |row| {
+        Ok(User {
+            id: row.get(0)?,
+            username: row.get(1)?,
+            password: cipher.decrypt(&row.get::<_, String>(2)?),
+            is_admin: row.get::<_, i64>(3)? != 0,
+        })
+    });
+    match rows {
+        Ok(iter) => iter.flatten().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Delete a user by username (cascades to their tidal_accounts row). Returns the
+/// deleted user's id, if any.
+pub async fn delete_user(db: &SharedDb, username: &str) -> Option<i64> {
+    let conn = db.lock().await;
+    let id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM users WHERE username = ?1",
+            params![username],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    if let Some(id) = id {
+        let _ = conn.execute("DELETE FROM users WHERE id = ?1", params![id]);
+    }
+    id
+}
+
+/// Update a user's password and/or admin flag. Returns their id, or None if the
+/// user doesn't exist.
+pub async fn update_user(
+    db: &SharedDb,
+    cipher: &Cipher,
+    username: &str,
+    new_password: Option<&str>,
+    new_admin: Option<bool>,
+) -> Option<i64> {
+    let conn = db.lock().await;
+    let id: i64 = conn
+        .query_row(
+            "SELECT id FROM users WHERE username = ?1",
+            params![username],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()?;
+    if let Some(pw) = new_password {
+        let _ = conn.execute(
+            "UPDATE users SET password_encrypted = ?1 WHERE id = ?2",
+            params![cipher.encrypt(pw), id],
+        );
+    }
+    if let Some(admin) = new_admin {
+        let _ = conn.execute(
+            "UPDATE users SET is_admin = ?1 WHERE id = ?2",
+            params![admin as i64, id],
+        );
+    }
+    Some(id)
 }
 
 // ---- Per-user TIDAL accounts ----
@@ -327,105 +380,15 @@ fn get_config_str(conn: &Connection, key: &str, default: &str) -> String {
     .unwrap_or_else(|_| default.to_string())
 }
 
-fn set_config_str(conn: &Connection, key: &str, value: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO config (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![key, value],
-    )?;
-    Ok(())
-}
-
-fn get_config_u64(conn: &Connection, key: &str) -> Option<u64> {
-    conn.query_row(
-        "SELECT value FROM config WHERE key = ?1",
-        params![key],
-        |row| {
-            let s: String = row.get(0)?;
-            Ok(s.parse::<u64>().ok())
-        },
-    )
-    .ok()
-    .flatten()
-}
-
+/// Load the server/TIDAL-app config (not per-user data). Per-user credentials
+/// and TIDAL tokens live in the `users` / `tidal_accounts` tables.
 pub async fn load_config(db: &SharedDb) -> DbConfig {
     let conn = db.lock().await;
     let mut cfg = DbConfig::default();
-
     cfg.tidal_client_id = get_config_str(&conn, "tidal_client_id", "");
     cfg.tidal_client_secret = get_config_str(&conn, "tidal_client_secret", "");
     cfg.tidal_max_quality = get_config_str(&conn, "tidal_max_quality", "HIGH");
     cfg.server_host = get_config_str(&conn, "server_host", "0.0.0.0");
     cfg.server_port = get_config_str(&conn, "server_port", "4533").parse().unwrap_or(4533);
-    cfg.subsonic_username = get_config_str(&conn, "subsonic_username", "tidal");
-    cfg.subsonic_password = get_config_str(&conn, "subsonic_password", "tidal");
-
-    // Load tokens
-    let token_row = conn.query_row(
-        "SELECT access_token, refresh_token, user_id, country_code FROM tidal_tokens WHERE id = 1",
-        [],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        },
-    );
-    if let Ok((at, rt, uid, cc)) = token_row {
-        cfg.tidal_access_token = at;
-        cfg.tidal_refresh_token = rt;
-        cfg.tidal_user_id = uid.map(|u| u as u64);
-        cfg.tidal_country_code = cc;
-    }
-
     cfg
-}
-
-pub async fn save_config(db: &SharedDb, cfg: &DbConfig) -> Result<()> {
-    let conn = db.lock().await;
-
-    set_config_str(&conn, "tidal_client_id", &cfg.tidal_client_id)?;
-    set_config_str(&conn, "tidal_client_secret", &cfg.tidal_client_secret)?;
-    set_config_str(&conn, "tidal_max_quality", &cfg.tidal_max_quality)?;
-    set_config_str(&conn, "server_host", &cfg.server_host)?;
-    set_config_str(&conn, "server_port", &cfg.server_port.to_string())?;
-    set_config_str(&conn, "subsonic_username", &cfg.subsonic_username)?;
-    set_config_str(&conn, "subsonic_password", &cfg.subsonic_password)?;
-
-    Ok(())
-}
-
-pub async fn save_tokens(
-    db: &SharedDb,
-    access_token: &str,
-    refresh_token: &str,
-    user_id: Option<u64>,
-    country_code: &str,
-) -> Result<()> {
-    let conn = db.lock().await;
-    conn.execute(
-        "INSERT INTO tidal_tokens (id, access_token, refresh_token, user_id, country_code, updated_at)
-         VALUES (1, ?1, ?2, ?3, ?4, datetime('now'))
-         ON CONFLICT(id) DO UPDATE SET
-           access_token = excluded.access_token,
-           refresh_token = excluded.refresh_token,
-           user_id = excluded.user_id,
-           country_code = excluded.country_code,
-           updated_at = excluded.updated_at",
-        params![access_token, refresh_token, user_id.map(|u| u as i64), country_code],
-    )?;
-    Ok(())
-}
-
-pub async fn is_authenticated(db: &SharedDb) -> bool {
-    let conn = db.lock().await;
-    conn.query_row(
-        "SELECT COUNT(*) FROM tidal_tokens WHERE id = 1 AND access_token != ''",
-        [],
-        |row| row.get::<_, i32>(0),
-    )
-    .map(|c| c > 0)
-    .unwrap_or(false)
 }

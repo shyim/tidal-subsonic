@@ -76,19 +76,20 @@ input:focus {
 <p class="subtitle">Stream your TIDAL library through any Subsonic client</p>
 
 <div class="card">
+<p class="subtitle" style="margin-top:0">Sign in with your Subsonic account to link your TIDAL library.</p>
 <form action="/authorize" method="POST">
   <label>Your Subsonic Username</label>
-  <input type="text" name="subsonic_username" value="tidal" placeholder="Subsonic username" />
+  <input type="text" name="subsonic_username" placeholder="Subsonic username" autocomplete="username" />
 
   <label>Your Subsonic Password</label>
-  <input type="password" name="subsonic_password" value="tidal" placeholder="Subsonic password" />
+  <input type="password" name="subsonic_password" placeholder="Subsonic password" autocomplete="current-password" />
 
-  <button class="btn" type="submit">Login with TIDAL</button>
+  <button class="btn" type="submit">Link my TIDAL account</button>
 </form>
 </div>
 
 <div class="note">
-  <b>💡 Tip:</b> Set a unique username and password for your Subsonic clients.
+  <b>💡 Tip:</b> Use the same username/password your Subsonic client connects with. An admin creates accounts; each user links their own TIDAL.
 </div>
 </body>
 </html>

@@ -115,6 +115,17 @@ pub(crate) struct SubsonicParams {
     pub(crate) callback: Option<String>,
     #[serde(default)]
     pub(crate) format: Option<String>,
+    // User-management params (createUser/updateUser/changePassword/deleteUser).
+    // `username` is the *target* user; `password` is the target's new password
+    // (distinct from the `p=` auth param, which is the caller's own password).
+    #[serde(default)]
+    pub(crate) username: Option<String>,
+    #[serde(default)]
+    pub(crate) password: Option<String>,
+    #[serde(default)]
+    pub(crate) email: Option<String>,
+    #[serde(default, rename = "adminRole")]
+    pub(crate) admin_role: Option<bool>,
 }
 
 impl SubsonicParams {

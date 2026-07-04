@@ -13,7 +13,7 @@ mod tidal;
 use app::AppState;
 use axum::routing::get;
 use reqwest::Client as ReqwestClient;
-use routes::{browsing, fallback, lists, media, playlists, search, system};
+use routes::{browsing, fallback, lists, media, playlists, search, system, users};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
@@ -115,6 +115,11 @@ async fn main() {
         ("download", get(media::handle_download)),
         ("scrobble", get(system::handle_scrobble)),
         ("getUser", get(system::handle_get_user)),
+        ("getUsers", get(users::handle_get_users)),
+        ("createUser", get(users::handle_create_user)),
+        ("updateUser", get(users::handle_update_user)),
+        ("deleteUser", get(users::handle_delete_user)),
+        ("changePassword", get(users::handle_change_password)),
         ("getScanStatus", get(system::handle_get_scan_status)),
         ("startScan", get(system::handle_start_scan)),
         ("getGenres", get(system::handle_get_genres)),

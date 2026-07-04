@@ -25,6 +25,7 @@ pub enum Payload {
     Playlists(PlaylistsWrapper),
     Playlist(PlaylistWithSongs),
     User(SubsonicUser),
+    Users(Users),
     ScanStatus(ScanStatus),
     Genres(GenresWrapper),
     OpenSubsonicExtensions(Vec<OpenSubsonicExtension>),
@@ -56,6 +57,7 @@ impl Payload {
             Payload::Playlists(v) => st.serialize_field("playlists", v),
             Payload::Playlist(v) => st.serialize_field("playlist", v),
             Payload::User(v) => st.serialize_field("user", v),
+            Payload::Users(v) => st.serialize_field("users", v),
             Payload::ScanStatus(v) => st.serialize_field("scanStatus", v),
             Payload::Genres(v) => st.serialize_field("genres", v),
             Payload::OpenSubsonicExtensions(v) => st.serialize_field("openSubsonicExtensions", v),
@@ -581,7 +583,13 @@ pub struct PlaylistWithSongs {
     pub entry: Vec<SubsonicChild>,
 }
 
-// ------ User ------ 
+// ------ User ------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Users {
+    #[serde(rename = "user", default)]
+    pub user: Vec<SubsonicUser>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SubsonicUser {

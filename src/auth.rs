@@ -21,6 +21,8 @@ pub struct PkceSession {
     pub client_unique_key: String,
     pub client_id: String,
     pub client_secret: String,
+    /// The Subsonic user this OAuth flow is linking a TIDAL account to.
+    pub subsonic_user_id: i64,
 }
 
 static SETUP_HTML: &str = include_str!("setup.html");
@@ -41,56 +43,11 @@ pub fn auth_routes() -> Router<crate::app::AppState> {
 }
 
 async fn handle_setup_page(
-    State(state): State<crate::app::AppState>,
+    State(_state): State<crate::app::AppState>,
     Query(_params): Query<SetupQuery>,
 ) -> Response {
-    let db = &state.db;
-    let config = db::load_config(db).await;
-
-    // Check if already authenticated
-    if !config.tidal_access_token.is_empty() && config.tidal_user_id.is_some() {
-        // Interpolated values are user-controlled (set via the setup form) and
-        // persisted, so they must be HTML-escaped to avoid stored XSS. The
-        // password is a secret — never echo it back into the page.
-        let html = format!(
-            r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TIDAL Subsonic</title>
-<style>
-body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width:600px; margin:60px auto; padding:20px; background:#0a0a0a; color:#eee; }}
-h1 {{ color:#00d4aa; }}
-.card {{ background:#1a1a1a; border-radius:12px; padding:24px; border:1px solid #333; }}
-.success {{ color:#00d4aa; }}
-code {{ background:#333; padding:2px 6px; border-radius:4px; }}
-.info {{ color:#888; font-size:14px; }}
-a {{ color:#00d4aa; }}
-</style>
-</head>
-<body>
-<div class="card">
-<h1>✅ TIDAL Subsonic</h1>
-<p class="success">Authenticated with TIDAL as user <code>{user_id}</code></p>
-<p class="info">Your Subsonic server is running. Connect with:</p>
-<p>
-  <b>URL:</b> <code>http://{host}:{port}</code><br>
-  <b>Username:</b> <code>{username}</code><br>
-  <b>Password:</b> <span class="info">(the password you set during setup)</span>
-</p>
-</div>
-</body>
-</html>"#,
-            user_id = config.tidal_user_id.unwrap_or(0),
-            host = html_escape(&config.server_host),
-            port = config.server_port,
-            username = html_escape(&config.subsonic_username),
-        );
-        return (StatusCode::OK, [("content-type", "text/html")], html).into_response();
-    }
-
-    // Show setup page
+    // Multi-user: each user links their own TIDAL account. The setup page asks
+    // for their Subsonic credentials, then walks them through TIDAL OAuth.
     let html = SETUP_HTML.to_string();
     (StatusCode::OK, [("content-type", "text/html")], html).into_response()
 }
@@ -102,41 +59,30 @@ async fn handle_authorize(
     // password out of the URL/query string. Form must be the last extractor.
     Form(params): Form<SetupQuery>,
 ) -> Response {
-    // Once TIDAL is set up, refuse to re-run the setup flow. Otherwise an
-    // unauthenticated caller who can reach this endpoint could overwrite the
-    // stored Subsonic username/password (a credential-reset bypass).
-    {
-        let cfg = db::load_config(&state.db).await;
-        if !cfg.tidal_access_token.is_empty() && cfg.tidal_user_id.is_some() {
+    // Identify WHICH Subsonic user is linking their TIDAL account: verify the
+    // submitted username + password against the users table. Anyone who can't
+    // prove they own an account can't link (or hijack) a TIDAL session.
+    let username = params.subsonic_username.clone().unwrap_or_default();
+    let password = params.subsonic_password.clone().unwrap_or_default();
+    let user = db::find_user(&state.db, &state.cipher, &username).await;
+    let subsonic_user_id = match user {
+        Some(u) if !password.is_empty() && u.password == password => u.id,
+        _ => {
             return (
-                StatusCode::FORBIDDEN,
+                StatusCode::UNAUTHORIZED,
                 [("content-type", "text/html")],
                 r#"<!DOCTYPE html><html><body style="font-family:sans-serif;max-width:600px;margin:60px auto;background:#0a0a0a;color:#eee">
-<h1 style="color:#00d4aa">Already set up</h1>
-<p>This server is already connected to TIDAL. To change credentials, stop the server and reset its database.</p>
+<h1 style="color:#ff6666">Login failed</h1>
+<p>Wrong Subsonic username or password. <a href="/" style="color:#00d4aa">Try again</a>.</p>
 </body></html>"#,
             )
                 .into_response();
         }
-    }
+    };
 
     // Use hard-coded client_id, ignore user input
     let client_id = DEFAULT_CLIENT_ID.to_string();
     let client_secret = String::new();
-
-    // Save client_id and subsonic credentials immediately
-    {
-        let mut cfg = db::load_config(&state.db).await;
-        cfg.tidal_client_id = client_id.clone();
-        cfg.tidal_client_secret = client_secret.clone();
-        if let Some(ref u) = params.subsonic_username {
-            if !u.is_empty() { cfg.subsonic_username = u.clone(); }
-        }
-        if let Some(ref p) = params.subsonic_password {
-            if !p.is_empty() { cfg.subsonic_password = p.clone(); }
-        }
-        db::save_config(&state.db, &cfg).await.ok();
-    }
 
     // Generate PKCE parameters (scoped so rng is dropped before await)
     let (code_verifier, code_challenge, client_unique_key) = {
@@ -164,6 +110,7 @@ async fn handle_authorize(
                 client_unique_key: client_unique_key.clone(),
                 client_id: client_id.clone(),
                 client_secret: client_secret.clone(),
+                subsonic_user_id,
             },
         );
     }
@@ -306,30 +253,24 @@ async fn handle_callback(
             // Get country code from session
             let cc = get_country_code(&client, &access_token).await.unwrap_or_else(|_| "US".to_string());
 
-            // Link the TIDAL account to the target Subsonic user. Until per-user
-            // OAuth linking (step 4) exists, this targets the admin (the migrated
-            // single user).
+            // Link the TIDAL account to the Subsonic user this flow authenticated.
             let account = db::TidalAccount {
                 access_token: access_token.clone(),
                 refresh_token: refresh_token.clone(),
                 tidal_user_id: Some(user_id),
                 country_code: cc.clone(),
             };
-            if let Some(target_user_id) = db::first_admin_id(&state.db).await {
-                db::save_tidal_account(&state.db, &state.cipher, target_user_id, &account)
-                    .await
-                    .ok();
-                // Drop any cached client so the next request rebuilds with the
-                // fresh tokens.
-                state.registry.invalidate(target_user_id).await;
-                tracing::info!(
-                    "Linked TIDAL account (tidal user {}) to Subsonic user {}",
-                    user_id,
-                    target_user_id
-                );
-            } else {
-                tracing::warn!("No admin user to link the TIDAL account to");
-            }
+            let target_user_id = session.subsonic_user_id;
+            db::save_tidal_account(&state.db, &state.cipher, target_user_id, &account)
+                .await
+                .ok();
+            // Drop any cached client so the next request rebuilds with fresh tokens.
+            state.registry.invalidate(target_user_id).await;
+            tracing::info!(
+                "Linked TIDAL account (tidal user {}) to Subsonic user {}",
+                user_id,
+                target_user_id
+            );
 
             // Clear PKCE session
             {
@@ -451,18 +392,3 @@ fn urlencoding(s: &str) -> String {
     s.replace(":", "%3A").replace("/", "%2F")
 }
 
-/// Escape a string for safe interpolation into HTML text/attribute context.
-fn html_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#x27;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
