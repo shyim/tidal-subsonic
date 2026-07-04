@@ -33,9 +33,6 @@ impl TidalClient {
         let data: Resp = serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
         Ok(PaginatedResponse {
             items: data.items,
-            total_number_of_items: data.total_number_of_items,
-            offset,
-            limit,
         })
     }
 
@@ -75,9 +72,6 @@ impl TidalClient {
         let data: Resp = serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
         Ok(PaginatedTracks {
             items: data.items,
-            total_number_of_items: data.total_number_of_items,
-            offset: data.offset,
-            limit: data.limit,
         })
     }
 
@@ -117,9 +111,6 @@ impl TidalClient {
         let data: FavResponse = serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
         Ok(PaginatedTracks {
             items: data.items.into_iter().map(|f| f.item).collect(),
-            total_number_of_items: data.total_number_of_items,
-            offset: data.offset,
-            limit: data.limit,
         })
     }
 
@@ -155,9 +146,6 @@ impl TidalClient {
         let data: FavResponse = serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
         Ok(PaginatedResponse {
             items: data.items.into_iter().map(|f| f.item).collect(),
-            total_number_of_items: data.total_number_of_items,
-            offset,
-            limit,
         })
     }
 
@@ -193,9 +181,6 @@ impl TidalClient {
         let data: FavResponse = serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
         Ok(PaginatedResponse {
             items: data.items.into_iter().map(|f| f.item).collect(),
-            total_number_of_items: data.total_number_of_items,
-            offset,
-            limit,
         })
     }
 
@@ -311,9 +296,6 @@ impl TidalClient {
         let data: Resp = serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
         Ok(PaginatedTracks {
             items: data.items,
-            total_number_of_items: data.total_number_of_items,
-            offset: data.offset,
-            limit: data.limit,
         })
     }
 
@@ -351,9 +333,6 @@ impl TidalClient {
         let data: Resp = serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
         Ok(PaginatedResponse {
             items: data.items,
-            total_number_of_items: data.total_number_of_items,
-            offset,
-            limit,
         })
     }
 
@@ -408,9 +387,6 @@ impl TidalClient {
         let data: Resp = serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
         Ok(PaginatedTracks {
             items: data.items,
-            total_number_of_items: data.total_number_of_items,
-            offset,
-            limit,
         })
     }
 

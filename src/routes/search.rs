@@ -69,12 +69,12 @@ async fn build_search(
     let artists: Vec<SubsonicArtist> = results.artists[w.artist_offset as usize..]
         .iter()
         .take(w.artist_count as usize)
-        .map(|a| mapping::search_artist_to_subsonic(a))
+        .map(mapping::search_artist_to_subsonic)
         .collect();
     let albums: Vec<SubsonicAlbum> = results.albums[w.album_offset as usize..]
         .iter()
         .take(w.album_count as usize)
-        .map(|a| mapping::album_to_subsonic(a))
+        .map(mapping::album_to_subsonic)
         .collect();
     let songs: Vec<SubsonicChild> = results.tracks[w.song_offset as usize..]
         .iter()

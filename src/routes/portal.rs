@@ -230,6 +230,9 @@ struct UserView {
     tidal_linked: bool,
 }
 
+// The Err is an axum Response (inherently large); it's used only for immediate
+// early-return control flow, so boxing it would add indirection for no benefit.
+#[allow(clippy::result_large_err)]
 fn require_admin(s: &WebSession) -> Result<(), Response> {
     if s.is_admin {
         Ok(())

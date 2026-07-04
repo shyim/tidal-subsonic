@@ -19,7 +19,7 @@ pub(crate) async fn handle_get_playlists(authed: Authed) -> ApiResult {
             let sub_playlists: Vec<SubsonicPlaylist> = playlists
                 .items
                 .iter()
-                .map(|p| mapping::playlist_to_subsonic(p))
+                .map(mapping::playlist_to_subsonic)
                 .collect();
             Ok(PlaylistsWrapper {
                 playlist: sub_playlists,

@@ -1,5 +1,4 @@
-use super::types::*;
-use crate::db::{self, DbConfig, SharedDb};
+use crate::db::{self, SharedDb};
 use reqwest::Client;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -19,7 +18,6 @@ pub(super) const QUALITY_LADDER: &[&str] = &["HI_RES_LOSSLESS", "LOSSLESS", "HIG
 const TIDAL_AUTH_URL: &str = "https://auth.tidal.com/v1/oauth2";
 pub(super) const TIDAL_API_URL: &str = "https://api.tidal.com/v1";
 pub(super) const TIDAL_API_V2_URL: &str = "https://api.tidal.com/v2";
-const TIDAL_OPENAPI_URL: &str = "https://openapi.tidal.com/v2";
 
 /// The mutable credential state of a `TidalClient`. Kept behind a small mutex
 /// inside the client so the reqwest client and outer handle can be shared
@@ -83,14 +81,6 @@ impl TidalClient {
         }
     }
 
-    pub async fn set_tokens(&self, access_token: String, refresh_token: String, user_id: Option<u64>, country_code: String) {
-        let mut creds = self.creds.lock().await;
-        creds.access_token = access_token;
-        creds.refresh_token = refresh_token;
-        creds.user_id = user_id;
-        creds.country_code = country_code;
-    }
-
     /// Persist the current credentials to this user's `tidal_accounts` row. Call
     /// whenever tokens change so a rotated refresh token survives a restart.
     pub(super) async fn persist_creds(&self) {
@@ -112,10 +102,6 @@ impl TidalClient {
         }
     }
 
-    pub async fn is_authenticated(&self) -> bool {
-        !self.creds.lock().await.access_token.is_empty()
-    }
-
     pub async fn user_id(&self) -> Option<u64> {
         self.creds.lock().await.user_id
     }
@@ -124,101 +110,8 @@ impl TidalClient {
         self.creds.lock().await.access_token.clone()
     }
 
-    pub async fn refresh_token(&self) -> String {
-        self.creds.lock().await.refresh_token.clone()
-    }
-
     pub async fn country_code(&self) -> String {
         self.creds.lock().await.country_code.clone()
-    }
-
-    // ------ Auth ------ 
-
-    pub async fn start_device_auth(&self) -> Result<DeviceAuthResponse, String> {
-        let client_id = &self.client_id;
-        if client_id.is_empty() {
-            return Err("Client ID not configured. Set it in config.toml".into());
-        }
-
-        let response = self
-            .client
-            .post(format!("{}/device_authorization", TIDAL_AUTH_URL))
-            .form(&[
-                ("client_id", client_id.as_str()),
-                ("scope", "r_usr w_usr w_sub"),
-            ])
-            .send()
-            .await
-            .map_err(|e| format!("Network error: {}", e))?;
-
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-
-        if !status.is_success() {
-            return Err(format!("Auth error ({}): {}", status, body));
-        }
-
-        #[derive(Deserialize)]
-        struct Resp {
-            device_code: String,
-            user_code: String,
-            verification_uri_complete: String,
-            expires_in: u64,
-        }
-
-        let data: Resp =
-            serde_json::from_str(&body).map_err(|e| format!("Parse error: {} - Body: {}", e, body))?;
-
-        Ok(DeviceAuthResponse {
-            device_code: data.device_code,
-            user_code: data.user_code,
-            verification_uri_complete: data.verification_uri_complete,
-            expires_in: data.expires_in,
-        })
-    }
-
-    pub async fn poll_device_token(&self, device_code: &str) -> Result<Option<()>, String> {
-        let client_id = &self.client_id;
-
-        let response = self
-            .client
-            .post(format!("{}/token", TIDAL_AUTH_URL))
-            .form(&[
-                ("client_id", client_id.as_str()),
-                ("device_code", device_code),
-                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ("scope", "r_usr w_usr w_sub"),
-            ])
-            .send()
-            .await
-            .map_err(|e| format!("Network error: {}", e))?;
-
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-
-        if status.as_u16() == 400
-            && (body.contains("authorization_pending") || body.contains("slow_down"))
-        {
-            return Ok(None);
-        }
-
-        if !status.is_success() {
-            return Err(format!("Auth error ({}): {}", status, body));
-        }
-
-        #[derive(Deserialize)]
-        struct TokenResp {
-            access_token: String,
-            refresh_token: String,
-            #[serde(default)]
-            user_id: Option<u64>,
-        }
-
-        let _tokens: TokenResp = serde_json::from_str(&body)
-            .map_err(|e| format!("Parse error: {} - Body: {}", e, body))?;
-
-        // We can't save here because we don't have &self
-        Ok(Some(()))
     }
 
     pub(super) async fn refresh_token_request(&self) -> Result<(String, String), String> {
@@ -257,8 +150,6 @@ impl TidalClient {
             access_token: String,
             #[serde(default)]
             refresh_token: Option<String>,
-            #[serde(default)]
-            user_id: Option<u64>,
         }
 
         let tokens: RefreshResp = serde_json::from_str(&body)
@@ -355,34 +246,4 @@ impl TidalClient {
         serde_json::from_str(&body).map_err(|e| format!("Parse error: {} - Body: {}", e, &body[..body.len().min(300)]))
     }
 
-    // ------ API Methods ------ 
-
-    pub async fn get_session_info(&self) -> Result<u64, String> {
-        let body = self.authenticated_get(
-            &format!("{}/sessions", TIDAL_API_URL),
-            &[],
-        ).await?;
-
-        #[derive(Deserialize)]
-        struct SessionResponse {
-            user_id: u64,
-            #[serde(default)]
-            country_code: Option<String>,
-        }
-
-        let data: SessionResponse =
-            serde_json::from_str(&body).map_err(|e| format!("Parse error: {}", e))?;
-        {
-            let mut creds = self.creds.lock().await;
-            if let Some(cc) = data.country_code {
-                if !cc.is_empty() {
-                    creds.country_code = cc;
-                }
-            }
-            creds.user_id = Some(data.user_id);
-        }
-        // Persist the freshly discovered user_id / country_code.
-        self.persist_creds().await;
-        Ok(data.user_id)
-    }
 }

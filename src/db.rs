@@ -580,11 +580,13 @@ fn get_config_str(conn: &Connection, key: &str, default: &str) -> String {
 /// and TIDAL tokens live in the `users` / `tidal_accounts` tables.
 pub async fn load_config(db: &SharedDb) -> DbConfig {
     let conn = db.lock().await;
-    let mut cfg = DbConfig::default();
-    cfg.tidal_client_id = get_config_str(&conn, "tidal_client_id", "");
-    cfg.tidal_client_secret = get_config_str(&conn, "tidal_client_secret", "");
-    cfg.tidal_max_quality = get_config_str(&conn, "tidal_max_quality", "HIGH");
-    cfg.server_host = get_config_str(&conn, "server_host", "0.0.0.0");
-    cfg.server_port = get_config_str(&conn, "server_port", "4533").parse().unwrap_or(4533);
-    cfg
+    DbConfig {
+        tidal_client_id: get_config_str(&conn, "tidal_client_id", ""),
+        tidal_client_secret: get_config_str(&conn, "tidal_client_secret", ""),
+        tidal_max_quality: get_config_str(&conn, "tidal_max_quality", "HIGH"),
+        server_host: get_config_str(&conn, "server_host", "0.0.0.0"),
+        server_port: get_config_str(&conn, "server_port", "4533")
+            .parse()
+            .unwrap_or(4533),
+    }
 }

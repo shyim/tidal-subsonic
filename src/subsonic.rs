@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 /// exactly one Subsonic wire element/key (e.g. `albumList`, `searchResult3`).
 /// The response's manual `Serialize` impl emits the variant under that exact
 /// name, reproducing the historical per-field output byte-for-byte.
+// One `Payload` is built per response and immediately serialized, so the size
+// difference between variants (a tiny License vs a large AlbumWithSongs) is
+// irrelevant — boxing would only add allocation churn.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Payload {
     License(License),

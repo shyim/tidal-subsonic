@@ -57,7 +57,7 @@ pub(crate) async fn handle_get_artist(authed: Authed) -> ApiResult {
             let sub_artist = mapping::artist_to_subsonic(&artist_detail);
             let mut sub_albums = Vec::new();
             if let Ok(albums) = client.get_artist_albums(artist_id, 0, 100).await {
-                sub_albums = albums.items.iter().map(|a| mapping::album_to_subsonic(a)).collect();
+                sub_albums = albums.items.iter().map(mapping::album_to_subsonic).collect();
             }
             Ok(ArtistWithAlbums {
                 id: sub_artist.id,

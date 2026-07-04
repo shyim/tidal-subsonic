@@ -79,45 +79,6 @@ fn base64_decode(s: &str) -> Option<String> {
         .and_then(|bytes| String::from_utf8(bytes).ok())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cover_art_id_roundtrips_dashes_to_slashes() {
-        let raw = "b66a5c40-c34d-4507-a0dc-5f98e46fdd20";
-        let id = cover_art_id(raw);
-        let url = &cover_art_urls(&id, 640)[0];
-        assert_eq!(
-            url,
-            "https://resources.tidal.com/images/b66a5c40/c34d/4507/a0dc/5f98e46fdd20/640x640.jpg"
-        );
-    }
-
-    #[test]
-    fn cover_art_urls_prefers_requested_size_then_falls_back() {
-        let id = cover_art_id("aa-bb");
-        let urls = cover_art_urls(&id, 320);
-        // First candidate is the exact requested size.
-        assert!(urls[0].contains("/320x320.jpg"));
-        // Every serveable size is offered as a fallback.
-        assert_eq!(urls.len(), 8);
-        // A size TIDAL doesn't serve for one kind is still reachable via fallback.
-        assert!(urls.iter().any(|u| u.contains("/480x480.jpg")));
-    }
-
-    #[test]
-    fn cover_art_urls_default_size_is_640() {
-        let id = cover_art_id("aa-bb");
-        assert!(cover_art_urls(&id, 0)[0].contains("/640x640.jpg"));
-    }
-
-    #[test]
-    fn cover_art_urls_passes_through_full_urls() {
-        let id = cover_art_id("https://example.com/a.jpg");
-        assert_eq!(cover_art_urls(&id, 640), vec!["https://example.com/a.jpg"]);
-    }
-}
 
 /// Convert a Tidal track to a Subsonic Child (song entry)
 pub fn track_to_child(track: &TidalTrack, _base_url: &str) -> SubsonicChild {
@@ -366,5 +327,45 @@ pub fn build_indexes(artists: &[TidalArtistDetail]) -> Indexes {
         ignored_articles: "The El La Los Las Le Les".to_string(),
         index: index_vec,
         child: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cover_art_id_roundtrips_dashes_to_slashes() {
+        let raw = "b66a5c40-c34d-4507-a0dc-5f98e46fdd20";
+        let id = cover_art_id(raw);
+        let url = &cover_art_urls(&id, 640)[0];
+        assert_eq!(
+            url,
+            "https://resources.tidal.com/images/b66a5c40/c34d/4507/a0dc/5f98e46fdd20/640x640.jpg"
+        );
+    }
+
+    #[test]
+    fn cover_art_urls_prefers_requested_size_then_falls_back() {
+        let id = cover_art_id("aa-bb");
+        let urls = cover_art_urls(&id, 320);
+        // First candidate is the exact requested size.
+        assert!(urls[0].contains("/320x320.jpg"));
+        // Every serveable size is offered as a fallback.
+        assert_eq!(urls.len(), 8);
+        // A size TIDAL doesn't serve for one kind is still reachable via fallback.
+        assert!(urls.iter().any(|u| u.contains("/480x480.jpg")));
+    }
+
+    #[test]
+    fn cover_art_urls_default_size_is_640() {
+        let id = cover_art_id("aa-bb");
+        assert!(cover_art_urls(&id, 0)[0].contains("/640x640.jpg"));
+    }
+
+    #[test]
+    fn cover_art_urls_passes_through_full_urls() {
+        let id = cover_art_id("https://example.com/a.jpg");
+        assert_eq!(cover_art_urls(&id, 640), vec!["https://example.com/a.jpg"]);
     }
 }

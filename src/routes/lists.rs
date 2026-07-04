@@ -45,7 +45,7 @@ async fn fetch_album_list(
 
     match list_type {
         "alphabeticalByName" => {
-            sub_albums.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            sub_albums.sort_by_key(|a| a.name.to_lowercase());
         }
         "alphabeticalByArtist" => {
             sub_albums.sort_by(|a, b| {
@@ -119,12 +119,12 @@ pub(crate) async fn handle_get_starred(authed: Authed, headers: HeaderMap) -> Ap
     }
     if let Ok(albums) = client.get_favorite_albums(user_id, 0, 100).await {
         starred.album = Some(
-            albums.items.iter().map(|a| mapping::album_to_subsonic(a)).collect()
+            albums.items.iter().map(mapping::album_to_subsonic).collect()
         );
     }
     if let Ok(artists) = client.get_favorite_artists(user_id, 0, 100).await {
         starred.artist = Some(
-            artists.items.iter().map(|a| mapping::artist_to_subsonic(a)).collect()
+            artists.items.iter().map(mapping::artist_to_subsonic).collect()
         );
     }
 

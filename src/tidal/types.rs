@@ -184,26 +184,18 @@ pub struct TidalPlaylistCreator {
     pub name: Option<String>,
 }
 
+/// A page of results. Only `items` is used; TIDAL's `totalNumberOfItems`,
+/// `offset`, and `limit` are ignored (the proxy paginates client-side).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaginatedResponse<T> {
     pub items: Vec<T>,
-    pub total_number_of_items: u32,
-    #[serde(default)]
-    pub offset: u32,
-    #[serde(default)]
-    pub limit: u32,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaginatedTracks {
     pub items: Vec<TidalTrack>,
-    pub total_number_of_items: u32,
-    #[serde(default)]
-    pub offset: u32,
-    #[serde(default)]
-    pub limit: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -247,16 +239,6 @@ pub struct StreamInfo {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct AlbumPageResponse {
-    pub album: TidalAlbumDetail,
-    pub tracks: Vec<TidalTrack>,
-    pub total_tracks: u32,
-    pub vibrant_color: Option<String>,
-    pub copyright: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TidalLyrics {
     #[serde(default)]
     pub lyrics: Option<String>,
@@ -264,10 +246,3 @@ pub struct TidalLyrics {
     pub subtitles: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct DeviceAuthResponse {
-    pub device_code: String,
-    pub user_code: String,
-    pub verification_uri_complete: String,
-    pub expires_in: u64,
-}
