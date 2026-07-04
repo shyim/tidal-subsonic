@@ -8,6 +8,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The web SPA is prebuilt in a dedicated step; skip build.rs's frontend build.
+  TIDAL_SUBSONIC_SKIP_WEB_BUILD: "1"
 
 jobs:
   build-and-test:
@@ -28,6 +30,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential pkg-config
+
+      # The web portal SPA is built (once) here; build.rs then reuses it via
+      # TIDAL_SUBSONIC_SKIP_WEB_BUILD so the Rust build stays JS-toolchain-free.
+      - name: Set up Node + pnpm
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build web portal
+        working-directory: web
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile || pnpm install
+          node node_modules/vite/bin/vite.js build
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4

@@ -28,7 +28,7 @@ Written in Rust with [axum](https://github.com/tokio-rs/axum).
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [First run &amp; admin](#first-run--admin)
-- [Linking a TIDAL account](#linking-a-tidal-account)
+- [The web portal](#the-web-portal)
 - [Managing users](#managing-users)
 - [Connecting a client](#connecting-a-client)
 - [Supported endpoints](#supported-endpoints)
@@ -87,7 +87,7 @@ cargo build --release
 The server listens on **port 4533**. On first run it creates its database and prints a generated admin password to the log — see [First run &amp; admin](#first-run--admin).
 
 > [!NOTE]
-> **Build requirement:** a **C compiler** (`gcc`/`clang`, or `build-essential` on Debian/Ubuntu). The MP3 encoder (`mp3lame-encoder`) compiles LAME from source via `cc`, and the bundled SQLite needs it too.
+> **Build requirements:** a **C compiler** (`gcc`/`clang`, or `build-essential` on Debian/Ubuntu) — the MP3 encoder (`mp3lame-encoder`) compiles LAME from source and the bundled SQLite needs it too — plus **Node + pnpm**, since `build.rs` builds the embedded web portal (`web/`) as part of `cargo build`. To build the Rust binary against a prebuilt portal (no Node), set `TIDAL_SUBSONIC_SKIP_WEB_BUILD=1` and provide `web/dist/index.html`.
 
 Prefer not to build locally? Jump to [Docker](#docker).
 
@@ -131,15 +131,16 @@ On first launch the server bootstraps an **`admin`** user:
 
   Copy it immediately. You can change it later with `changePassword`, or set `TIDAL_SUBSONIC_ADMIN_PASSWORD` before the first run to choose your own.
 
-## Linking a TIDAL account
+## The web portal
 
-Each user links their own TIDAL account through a small built-in web page (separate from the Subsonic API):
+tidal-subsonic ships a **built-in web portal** (a single-page app embedded in the binary — no separate service). Open **`http://<host>:4533/`** and sign in with your Subsonic credentials to:
 
-1. Open **`http://<host>:4533/`** in a browser.
-2. Enter your **Subsonic** username and password. This proves which account you're linking — the password is sent in the POST body, never the URL.
-3. You're redirected through TIDAL's OAuth login. After you authorize, the callback stores your **encrypted** TIDAL session against your Subsonic user.
+- **Link your TIDAL account** — walks you through TIDAL's OAuth: open the login page, paste the code, done. Re-link or unlink any time.
+- **See your connection details** — server URL + username with copy buttons, and how to add them to a Subsonic client.
+- **Change your password.**
+- **Manage users** (admins only) — a table of accounts with create, delete, promote/demote, and reset-password.
 
-Once linked, that user's Subsonic client can browse and stream. Until linked, browse calls return *"Not authenticated with TIDAL."*
+The portal is backed by a small JSON `/api/*` surface with cookie sessions (HttpOnly, SameSite=Strict); it's separate from the Subsonic `/rest/*` API. Until a user links TIDAL, their Subsonic browse calls return *"Not authenticated with TIDAL."*
 
 ## Managing users
 
@@ -275,7 +276,7 @@ cargo test                    # run the suite
 ./target/release/tidal-subsonic
 ```
 
-**Requirements:** a recent stable **Rust** toolchain and a **C compiler** (`build-essential` / `gcc` / `clang`) for the bundled SQLite and the LAME MP3 encoder.
+**Requirements:** a recent stable **Rust** toolchain, a **C compiler** (`build-essential` / `gcc` / `clang`) for the bundled SQLite and the LAME MP3 encoder, and **Node + pnpm** for the embedded web portal (`build.rs` runs the frontend build). The `Dockerfile` and CI handle all of this for you.
 
 ## License
 

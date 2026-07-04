@@ -1,5 +1,17 @@
 # syntax=docker/dockerfile:1
 
+# ---- Web build --------------------------------------------------------------
+# Build the embedded SPA (web/dist/index.html) in a Node stage so the Rust
+# builder doesn't need a JS toolchain and dependency layers cache well.
+FROM node:22-slim AS web
+WORKDIR /web
+RUN corepack enable
+COPY web/package.json web/pnpm-lock.yaml* web/.npmrc* ./
+RUN pnpm install --frozen-lockfile || pnpm install
+COPY web/ ./
+# pnpm 11 blocks a plain `pnpm build`; invoke Vite directly.
+RUN node node_modules/vite/bin/vite.js build
+
 # ---- Builder ----------------------------------------------------------------
 # rust:1-slim + build-essential gives us the C compiler that the bundled SQLite
 # and the LAME MP3 encoder (mp3lame-encoder builds LAME via `cc`) need.
@@ -12,10 +24,14 @@ RUN apt-get update \
 WORKDIR /app
 
 # Copy the manifests first so dependency compilation is cached separately from
-# the source, then copy the source and build the release binary.
-COPY Cargo.toml Cargo.lock* ./
+# the source, then copy the source. The prebuilt SPA comes from the web stage;
+# TIDAL_SUBSONIC_SKIP_WEB_BUILD tells build.rs to use it instead of re-building.
+COPY Cargo.toml Cargo.lock* build.rs ./
 COPY src ./src
+COPY --from=web /web/dist ./web/dist
+COPY web/package.json ./web/package.json
 
+ENV TIDAL_SUBSONIC_SKIP_WEB_BUILD=1
 RUN cargo build --release
 
 # ---- Runtime ----------------------------------------------------------------
