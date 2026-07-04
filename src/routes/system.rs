@@ -1,5 +1,6 @@
 use crate::app::{AppState, SubsonicParams};
 use crate::auth_mw::{respond, xml_ok, ApiOk, ApiResult, Authed};
+use crate::item_id::ItemId;
 use crate::subsonic::*;
 use axum::{
     extract::{Query, State},
@@ -31,8 +32,20 @@ pub(crate) async fn handle_get_music_folders(_authed: Authed) -> ApiResult {
     .into())
 }
 
-pub(crate) async fn handle_scrobble(_authed: Authed) -> ApiResult {
-    // Scrobbling is not implemented - just acknowledge
+pub(crate) async fn handle_scrobble(authed: Authed) -> ApiResult {
+    // Report the play to TIDAL so it counts toward the user's play history.
+    // Only on a real submission (a finished play); `submission=false` is a
+    // "now playing" ping we don't forward. Best-effort — never fail the call.
+    let is_submission = authed.params.submission.unwrap_or(true);
+    if is_submission {
+        if let Some(id) = authed.params.id.as_deref() {
+            if let Ok(ItemId::Track(track_id)) = id.parse::<ItemId>() {
+                if let Ok(client) = authed.tidal().await {
+                    client.report_play(track_id).await;
+                }
+            }
+        }
+    }
     Ok(ApiOk(xml_ok()))
 }
 

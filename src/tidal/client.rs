@@ -44,7 +44,7 @@ pub struct TidalClient {
     /// concurrent requests must not all refresh at once (the winner's rotation
     /// would invalidate the losers' refresh token). Held only around a refresh.
     refresh_lock: Mutex<()>,
-    client_id: String,
+    pub(in crate::tidal) client_id: String,
     client_secret: String,
     db: SharedDb,
     /// The Subsonic user this client belongs to — token persistence writes to
