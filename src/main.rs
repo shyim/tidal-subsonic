@@ -85,6 +85,7 @@ async fn main() {
         subsonic_username: subsonic_username.clone(),
         subsonic_password: subsonic_password.clone(),
         max_quality: max_quality.clone(),
+        media_cache: routes::media_cache::MediaCache::open(),
     };
 
     let mut app = auth::auth_routes();

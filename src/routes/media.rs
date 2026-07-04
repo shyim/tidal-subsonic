@@ -159,113 +159,94 @@ pub(crate) async fn handle_stream(authed: Authed, headers: HeaderMap) -> Respons
         return render_current(&xml_error(0, "Refusing to proxy an unsafe stream URL"));
     }
 
-    // MP3 transcode path: fetch the whole (AAC-LC-in-fMP4) track, decode+encode
-    // to MP3, and serve it as audio/mpeg with a Content-Length. Used by clients
-    // that require real MP3 bytes.
-    if wants_mp3 {
-        let raw = match fetch_full_track(&state.http_client, &stream_info).await {
-            Ok(b) => b,
-            Err(e) => return render_current(&xml_error(0, &format!("MP3 source fetch: {}", e))),
-        };
+    // Assemble (and, for MP3 clients, transcode) the whole track once, cache it
+    // on disk, and serve the cached file with range support. A cache hit skips
+    // both the CDN re-fetch and the transcode; range seeks read the local file.
+    let bitrate = if max_bit_rate == 0 { 320 } else { max_bit_rate };
+    let (content_type, cache_key) = if wants_mp3 {
+        ("audio/mpeg", format!("{track_id}.mp3.{bitrate}"))
+    } else {
+        // Non-mp3: the assembled fMP4. Key by the sourced quality so HIGH and
+        // LOSSLESS don't collide.
+        ("audio/mp4", format!("{track_id}.m4a.{ceiling}"))
+    };
 
-        let bitrate = if max_bit_rate == 0 { 320 } else { max_bit_rate };
-        match transcode::aac_mp4_to_mp3(raw, bitrate).await {
-            Ok(mp3) => {
-                let mut out_headers = axum::http::HeaderMap::new();
-                out_headers.insert(header::CONTENT_TYPE, "audio/mpeg".parse().unwrap());
-                out_headers.insert(
-                    header::CONTENT_LENGTH,
-                    mp3.len().to_string().parse().unwrap(),
-                );
-                out_headers.insert(header::ACCEPT_RANGES, "none".parse().unwrap());
-                out_headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
-                return (StatusCode::OK, out_headers, mp3).into_response();
+    let http = state.http_client.clone();
+    let info = stream_info;
+    let path = state
+        .media_cache
+        .get_or_build(&cache_key, move || async move {
+            let raw = fetch_full_track(&http, &info).await?;
+            if wants_mp3 {
+                transcode::aac_mp4_to_mp3(raw, bitrate).await
+            } else {
+                Ok(raw)
             }
-            Err(e) => {
-                tracing::warn!("MP3 transcode failed for track {}: {}", track_id, e);
-                return render_current(&xml_error(0, &format!("MP3 transcode failed: {}", e)));
-            }
-        }
-    }
+        })
+        .await;
 
-    // Segmented DASH: concatenate the ordered segments into one playable file.
-    if !stream_info.segments.is_empty() {
-        let range = headers
-            .get(header::RANGE)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        return stream_segments(&state.http_client, stream_info, range).await;
-    }
-
-    // Forward the client's Range header so seeking works and clients can
-    // stream progressively instead of waiting for the full file. reqwest and
-    // axum use different `http` crate versions, so pass the value as a string.
-    let mut req = state.http_client.get(&stream_info.url);
-    if let Some(range) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
-        req = req.header("range", range);
-    }
-
-    let upstream = match req.send().await {
-        Ok(r) => r,
+    let path = match path {
+        Ok(p) => p,
         Err(e) => {
-            return render_current(&xml_error(0, &format!("Stream fetch error: {}", e)));
+            tracing::warn!("media build failed for track {}: {}", track_id, e);
+            return render_current(&xml_error(0, &format!("Media error: {}", e)));
         }
     };
 
-    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::OK);
-    if !status.is_success() {
-        return render_current(&xml_error(0, &format!("Upstream stream error: HTTP {}", status)));
-    }
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    serve_file_with_range(&path, content_type, range.as_deref()).await
+}
 
-    // Preserve the headers a Subsonic client needs for playback and seeking.
-    let upstream_get = |name: &str| -> Option<String> {
-        upstream
-            .headers()
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
+/// Serve an on-disk file with `Accept-Ranges` and single-range `206` support,
+/// reading only the requested slice from disk.
+async fn serve_file_with_range(path: &std::path::Path, content_type: &str, range: Option<&str>) -> Response {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(e) => return (StatusCode::NOT_FOUND, format!("cache read: {}", e)).into_response(),
     };
-    let content_type =
-        upstream_get("content-type").unwrap_or_else(|| default_content_type(&stream_info.codec));
+    let total = match file.metadata().await {
+        Ok(m) => m.len(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("stat: {}", e)).into_response(),
+    };
+
+    let parsed = range.and_then(|r| parse_byte_range(r, total));
 
     let mut out_headers = axum::http::HeaderMap::new();
     out_headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
-    for name in ["content-length", "content-range", "accept-ranges"] {
-        if let Some(val) = upstream_get(name) {
-            if let (Ok(hn), Ok(hv)) = (
-                axum::http::HeaderName::from_bytes(name.as_bytes()),
-                val.parse::<axum::http::HeaderValue>(),
-            ) {
-                out_headers.insert(hn, hv);
-            }
-        }
-    }
+    out_headers.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
     out_headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
 
-    // Stream the body through instead of buffering the whole file in memory.
-    let body = axum::body::Body::from_stream(upstream.bytes_stream());
-    (status, out_headers, body).into_response()
-}
-
-/// Serve a segmented DASH track as a single seekable file. The segments are
-/// fetched and concatenated into one fragmented-MP4 buffer, then served with a
-/// `Content-Length` and range support — many players require a known size and a
-/// `206` response to a `Range` request before they will start playback.
-async fn stream_segments(
-    client: &ReqwestClient,
-    info: StreamInfo,
-    range: Option<String>,
-) -> Response {
-    // TIDAL's segmented streams are always fragmented MP4 (fMP4), regardless of
-    // the audio codec inside (AAC or FLAC-in-MP4), so advertise the container.
-    let content_type = "audio/mp4";
-
-    let buf = match fetch_all_segments(client, &info.segments).await {
-        Ok(b) => b,
-        Err(e) => return (StatusCode::BAD_GATEWAY, e).into_response(),
-    };
-
-    serve_bytes_with_range(buf, content_type, range.as_deref())
+    match parsed {
+        Some((start, end)) => {
+            let len = end - start + 1;
+            if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "seek").into_response();
+            }
+            let mut buf = vec![0u8; len as usize];
+            if file.read_exact(&mut buf).await.is_err() {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "read").into_response();
+            }
+            out_headers.insert(
+                header::CONTENT_RANGE,
+                format!("bytes {}-{}/{}", start, end, total).parse().unwrap(),
+            );
+            out_headers.insert(header::CONTENT_LENGTH, len.to_string().parse().unwrap());
+            (StatusCode::PARTIAL_CONTENT, out_headers, buf).into_response()
+        }
+        None => {
+            let mut buf = Vec::with_capacity(total as usize);
+            if file.read_to_end(&mut buf).await.is_err() {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "read").into_response();
+            }
+            out_headers.insert(header::CONTENT_LENGTH, total.to_string().parse().unwrap());
+            (StatusCode::OK, out_headers, buf).into_response()
+        }
+    }
 }
 
 /// Fetch a whole track into memory, whether it comes as DASH segments or a
@@ -310,36 +291,6 @@ async fn fetch_all_segments(client: &ReqwestClient, segments: &[String]) -> Resu
     Ok(buf)
 }
 
-/// Serve an in-memory body with `Accept-Ranges` and single-range `206` support.
-fn serve_bytes_with_range(data: Vec<u8>, content_type: &str, range: Option<&str>) -> Response {
-    let total = data.len() as u64;
-
-    // Parse a single "bytes=start-end" range; ignore anything more exotic.
-    let parsed = range.and_then(|r| parse_byte_range(r, total));
-
-    let mut out_headers = axum::http::HeaderMap::new();
-    out_headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
-    out_headers.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
-    out_headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
-
-    match parsed {
-        Some((start, end)) => {
-            // end is inclusive
-            let slice = data[start as usize..=end as usize].to_vec();
-            out_headers.insert(
-                header::CONTENT_RANGE,
-                format!("bytes {}-{}/{}", start, end, total).parse().unwrap(),
-            );
-            out_headers.insert(header::CONTENT_LENGTH, slice.len().to_string().parse().unwrap());
-            (StatusCode::PARTIAL_CONTENT, out_headers, slice).into_response()
-        }
-        None => {
-            out_headers.insert(header::CONTENT_LENGTH, total.to_string().parse().unwrap());
-            (StatusCode::OK, out_headers, data).into_response()
-        }
-    }
-}
-
 /// Parse a `Range: bytes=start-end` header into inclusive (start, end) byte
 /// offsets, clamped to the content length. Returns None for absent/unsatisfiable
 /// or open-ended-from-zero ranges (treated as a full 200 response).
@@ -377,15 +328,6 @@ fn parse_byte_range(header: &str, total: u64) -> Option<(u64, u64)> {
         return None;
     }
     Some((start, end))
-}
-
-fn default_content_type(codec: &Option<String>) -> String {
-    match codec.as_deref().map(|c| c.to_ascii_uppercase()) {
-        Some(ref c) if c.contains("FLAC") => "audio/flac".to_string(),
-        Some(ref c) if c.contains("AAC") || c.contains("MP4A") => "audio/mp4".to_string(),
-        Some(ref c) if c.contains("MP3") => "audio/mpeg".to_string(),
-        _ => "audio/flac".to_string(),
-    }
 }
 
 /// Cover-art IDs are user-supplied (a base64 blob that may decode to a full

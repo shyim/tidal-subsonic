@@ -1,6 +1,7 @@
 use crate::auth::PkceSession;
 use crate::db::SharedDb;
 use crate::response::ResponseFormat;
+use crate::routes::media_cache::MediaCache;
 use crate::tidal::SharedTidalClient;
 use axum::http::HeaderMap;
 use reqwest::Client as ReqwestClient;
@@ -17,6 +18,7 @@ pub(crate) struct AppState {
     pub(crate) subsonic_password: String,
     pub(crate) subsonic_username: String,
     pub(crate) max_quality: String,
+    pub(crate) media_cache: MediaCache,
 }
 
 #[derive(Debug, Default, Deserialize)]
