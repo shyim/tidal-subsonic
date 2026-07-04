@@ -1,0 +1,29 @@
+version: 2
+updates:
+  # Keep SHA-pinned GitHub Actions current (the reusable workflow + ci.yml).
+  # Dependabot rewrites the pinned SHA and updates the trailing version comment.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Rust dependencies.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+
+  # Web portal (Vite + Svelte) dependencies.
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+    groups:
+      npm:
+        patterns: ["*"]
