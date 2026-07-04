@@ -250,7 +250,12 @@ docker run -d --name tidal-subsonic \
 
 The image is built from a multi-stage `Dockerfile`: a Node stage builds the web portal, an Alpine/musl stage produces a fully static binary, and the runtime is Google's **`distroless/static`** — no shell, no libc, no package manager. The result is a **~16 MB** image with minimal attack surface. TLS to TIDAL works with no CA certificates in the image, because rustls verifies against webpki roots compiled into the binary. Building it yourself is just `docker build -t tidal-subsonic .`.
 
-Images are published automatically by the `release` GitHub Actions workflow: push a version tag (`git tag v0.1.0 && git push --tags`) and it builds each architecture natively and pushes `latest` + the version tags.
+Images are published automatically by the `release` GitHub Actions workflow, which uses Docker's maintained [`docker/github-builder`](https://github.com/docker/github-builder) reusable workflow (native multi-arch, SBOM + signed provenance, cached):
+
+- **every push to `main`** → the **`edge`** tag (plus `main-<sha>`)
+- **a version tag** (`git tag v0.1.0 && git push --tags`) → **`latest`** + `0.1.0` + `0.1`
+
+So `ghcr.io/shyim/tidal-subsonic:edge` always tracks the latest `main`, while `:latest` moves only on tagged releases.
 
 - The image sets `XDG_CONFIG_HOME=/config` and `XDG_CACHE_HOME=/cache`, so the database lands in `/config/tidal-subsonic/` and the media cache in `/cache/tidal-subsonic/`. **Mount both** to persist data.
 - **Set `TIDAL_SUBSONIC_KEY` explicitly** so the encryption key survives rebuilds. Without it, a new key is generated in the `/config` volume on first run.
