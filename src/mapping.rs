@@ -25,6 +25,38 @@ pub fn cover_art_id(image_ref: &str) -> String {
     format!("ca-{}", base64_encode(image_ref))
 }
 
+/// Normalize a TIDAL date/datetime into strict RFC 3339, which strict Subsonic
+/// clients (e.g. Supersonic / go-subsonic) require for `created`/`changed` — they
+/// decode those into a Go `time.Time`, and a non-RFC3339 value fails the WHOLE
+/// response unmarshal, leaving the list empty. Handles the two shapes TIDAL emits:
+/// a bare date `2009-06-09` becomes `2009-06-09T00:00:00Z`, and a `+0000` numeric
+/// offset becomes `+00:00` (RFC 3339 requires the colon). Anything already valid
+/// (ends in `Z` / has a colon offset) passes through unchanged.
+pub fn to_rfc3339(raw: &str) -> String {
+    let s = raw.trim();
+    if s.is_empty() {
+        return s.to_string();
+    }
+    // Bare `YYYY-MM-DD` (no time component).
+    if s.len() == 10 && !s.contains('T') {
+        return format!("{s}T00:00:00Z");
+    }
+    // A trailing numeric offset without a colon: `+0000` / `-0500`.
+    if let Some(pos) = s.rfind(['+', '-']).filter(|&p| p >= s.len().saturating_sub(5)) {
+        let (head, off) = s.split_at(pos);
+        // off is like "+0000"; insert the colon: "+00:00".
+        if off.len() == 5 && off[1..].chars().all(|c| c.is_ascii_digit()) {
+            return format!("{head}{}:{}", &off[..3], &off[3..]);
+        }
+    }
+    s.to_string()
+}
+
+/// Apply [`to_rfc3339`] to an optional date, dropping empties.
+fn opt_rfc3339(raw: Option<String>) -> Option<String> {
+    raw.map(|s| to_rfc3339(&s)).filter(|s| !s.is_empty())
+}
+
 /// Candidate CDN URLs for a cover-art ID, ordered by how well they match the
 /// requested square size. TIDAL serves different size sets for different image
 /// kinds (albums: 80/160/320/640/1280; artists: 160/320/480/750), so the caller
@@ -199,7 +231,7 @@ pub fn album_to_subsonic(album: &TidalAlbumDetail) -> SubsonicAlbum {
             .map(|c| cover_art_id(c)),
         song_count: album.number_of_tracks,
         duration: album.duration,
-        created: album.release_date.clone(),
+        created: opt_rfc3339(album.release_date.clone()),
         year,
         genre: None,
         starred: None,
@@ -283,8 +315,8 @@ pub fn playlist_to_subsonic(playlist: &TidalPlaylist) -> SubsonicPlaylist {
         public: playlist.public_playlist,
         song_count: playlist.number_of_tracks,
         duration: playlist.duration,
-        created: playlist.created.clone(),
-        changed: playlist.last_updated.clone(),
+        created: opt_rfc3339(playlist.created.clone()),
+        changed: opt_rfc3339(playlist.last_updated.clone()),
         cover_art: playlist
             .square_image
             .as_ref()
@@ -350,6 +382,25 @@ pub fn build_indexes(artists: &[TidalArtistDetail]) -> Indexes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rfc3339_normalizes_tidal_dates() {
+        // Bare date -> midnight UTC.
+        assert_eq!(to_rfc3339("2009-06-09"), "2009-06-09T00:00:00Z");
+        // TIDAL's +0000 offset -> colon offset.
+        assert_eq!(
+            to_rfc3339("2026-05-02T07:00:44.411+0000"),
+            "2026-05-02T07:00:44.411+00:00"
+        );
+        assert_eq!(
+            to_rfc3339("2026-05-02T07:00:44-0500"),
+            "2026-05-02T07:00:44-05:00"
+        );
+        // Already valid — pass through untouched.
+        assert_eq!(to_rfc3339("2009-06-09T00:00:00Z"), "2009-06-09T00:00:00Z");
+        assert_eq!(to_rfc3339("2026-05-02T07:00:44+00:00"), "2026-05-02T07:00:44+00:00");
+        assert_eq!(to_rfc3339(""), "");
+    }
 
     #[test]
     fn cover_art_id_roundtrips_dashes_to_slashes() {
