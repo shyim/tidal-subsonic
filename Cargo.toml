@@ -3,6 +3,9 @@ name = "tidal-subsonic"
 version = "0.1.0"
 edition = "2021"
 description = "A Subsonic-compatible API server backed by Tidal"
+authors = ["Soner Sayakci <s.sayakci@gmail.com>"]
+license = "GPL-3.0-only"
+readme = "README.md"
 
 [dependencies]
 # Web framework

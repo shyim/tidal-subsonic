@@ -279,4 +279,8 @@ cargo test                    # run the suite
 
 ## License
 
-GPL-3.0. This project talks to TIDAL's private APIs and is intended for personal use with your own TIDAL subscription; it is **not affiliated with or endorsed by TIDAL**.
+Licensed under the **GNU General Public License v3.0** — see [`LICENSE`](LICENSE) for the full text.
+
+> Copyright © 2026 Soner Sayakci
+
+This project talks to TIDAL's private APIs and is intended for personal use with your own TIDAL subscription; it is **not affiliated with or endorsed by TIDAL**.
